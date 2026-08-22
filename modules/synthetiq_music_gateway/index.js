@@ -1,14 +1,12 @@
 (() => {
   'use strict';
 
-  const API = 'https://one.synthetiq.uk/music-gateway-staging/v1';
   const MIRRORS = [
     'https://backend.listenfree.in/api',
     'https://backend2.listenfree.in/api',
     'https://music-api.albatross0071.workers.dev/api',
     'https://music-api2.albatross0071.workers.dev/api'
   ];
-  const REQUEST_TIMEOUT_MS = 10000;
 
   const _cipherKey = '38346591';
   const _ip = [58,50,42,34,26,18,10,2,60,52,44,36,28,20,12,4,62,54,46,38,30,22,14,6,64,56,48,40,32,24,16,8,57,49,41,33,25,17,9,1,59,51,43,35,27,19,11,3,61,53,45,37,29,21,13,5,63,55,47,39,31,23,15,7];
@@ -147,54 +145,26 @@
   function ok(data) { return { ok: true, data: JSON.stringify(data) }; }
   function fail(message) { return { ok: false, error: { message: String(message || 'Music gateway unavailable') } }; }
 
-  async function request(path, body) {
-    const url = API + path;
-    const headers = { Accept: 'application/json' };
-    let response;
-    if (typeof fetchv2 === 'function') {
-      if (body) headers['Content-Type'] = 'application/json';
-      response = await fetchv2(url, headers, body ? 'POST' : 'GET', body ? JSON.stringify(body) : null);
-      return typeof response === 'string' ? JSON.parse(response) : response;
-    } else if (typeof fetch === 'function') {
-      const controller = typeof AbortController === 'function' ? new AbortController() : null;
-      const timer = controller ? setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS) : null;
-      try {
-        response = await fetch(url, {
-          method: body ? 'POST' : 'GET', headers: body ? { ...headers, 'Content-Type': 'application/json' } : headers,
-          body: body ? JSON.stringify(body) : undefined, signal: controller ? controller.signal : undefined,
-        });
-        const status = Number(response && response.status || 0);
-        if (!response || status < 200 || status >= 300) throw new Error('gateway_http_' + status);
-        return await response.json();
-      } finally { if (timer) clearTimeout(timer); }
-    }
-    throw new Error('fetch_unavailable');
-  }
-
-  async function mirrorGet(path) {
+  async function httpGet(url) {
     const headers = {
       'Accept': 'application/json',
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
     };
+    try {
+      const res = await fetch(url, { method: 'GET', headers });
+      if (res.status === 200) {
+        return await res.json();
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  async function mirrorGet(path) {
     for (const mirror of MIRRORS) {
-      try {
-        const url = mirror + path;
-        if (typeof fetchv2 === 'function') {
-          const res = await fetchv2(url, headers, 'GET', null);
-          const parsed = typeof res === 'string' ? JSON.parse(res) : res;
-          if (parsed && (parsed.data || parsed.results || parsed.status === 'SUCCESS')) return parsed;
-        } else if (typeof fetch === 'function') {
-          const controller = typeof AbortController === 'function' ? new AbortController() : null;
-          const timer = controller ? setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS) : null;
-          try {
-            const res = await fetch(url, { method: 'GET', headers, signal: controller ? controller.signal : undefined });
-            if (res.status === 200) {
-              const data = await res.json();
-              if (data && (data.data || data.results || data.status === 'SUCCESS')) return data;
-            }
-          } finally { if (timer) clearTimeout(timer); }
-        }
-      } catch (_) {}
+      const data = await httpGet(mirror + path);
+      if (data && (data.data || data.results || data.success || data.status === 'SUCCESS')) {
+        return data;
+      }
     }
     return null;
   }
@@ -202,24 +172,7 @@
   async function directJioSaavn(params) {
     const query = Object.keys(params).map(k => encodeURIComponent(k) + '=' + encodeURIComponent(params[k])).join('&');
     const url = 'https://www.jiosaavn.com/api.php?_format=json&_marker=0&ctx=web6dot0&' + query;
-    const headers = {
-      'Accept': 'application/json',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
-    };
-    try {
-      if (typeof fetchv2 === 'function') {
-        const res = await fetchv2(url, headers, 'GET', null);
-        return typeof res === 'string' ? JSON.parse(res) : res;
-      } else if (typeof fetch === 'function') {
-        const controller = typeof AbortController === 'function' ? new AbortController() : null;
-        const timer = controller ? setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS) : null;
-        try {
-          const res = await fetch(url, { method: 'GET', headers, signal: controller ? controller.signal : undefined });
-          if (res.status === 200) return await res.json();
-        } finally { if (timer) clearTimeout(timer); }
-      }
-    } catch (_) {}
-    return null;
+    return await httpGet(url);
   }
 
   function toTrack(item) {
@@ -255,11 +208,6 @@
     };
   }
 
-  function parseTrack(id) {
-    const match = String(id || '').match(/^([^:]+):song:(.+)$/);
-    return match ? { providerId: match[1], providerItemId: match[2] } : null;
-  }
-
   async function searchResults(query, page) {
     const term = String(query || '').trim();
     if (!term) return ok([]);
@@ -268,7 +216,7 @@
     try {
       const p = Number(page) + 1 || 1;
       const res = await mirrorGet('/search/songs?query=' + encodeURIComponent(term) + '&page=' + p + '&limit=24');
-      const results = res?.data?.results || [];
+      const results = res?.data?.results || res?.results || [];
       if (results.length) {
         return ok(results.map(toTrack).filter(Boolean));
       }
@@ -289,14 +237,6 @@
       }
     } catch (_) {}
 
-    // 3. Try Staging Gateway
-    try {
-      const result = await request('/search', { query: term, page: Number(page) + 1 || 1, limit: 24 });
-      if (result && Array.isArray(result.items) && result.items.length) {
-        return ok(result.items.map(toTrack).filter(Boolean));
-      }
-    } catch (_) {}
-
     return ok([]);
   }
 
@@ -311,7 +251,7 @@
     }
 
     // 1. Direct mirror lookup by clean song ID
-    if (cleanId && !cleanId.startsWith('catalogue:') && cleanId.length >= 4 && !cleanId.contains(':')) {
+    if (cleanId && !cleanId.startsWith('catalogue:') && cleanId.length >= 4 && cleanId.indexOf(':') === -1) {
       try {
         const res = await mirrorGet('/songs/' + cleanId);
         const songData = Array.isArray(res?.data) ? res.data[0] : res?.data;
@@ -320,7 +260,7 @@
           let streamFallback = null;
           for (const d of songData.downloadUrl) {
             if (d?.url) {
-              if (String(d.quality).includes('320')) stream320 = d.url;
+              if (String(d.quality).indexOf('320') !== -1) stream320 = d.url;
               streamFallback = d.url;
             }
           }
@@ -358,9 +298,9 @@
         const encUrl = songData?.more_info?.encrypted_media_url;
         if (encUrl) {
           const dec = decryptMediaUrl(encUrl);
-          if (dec && dec.startsWith('http')) {
+          if (dec && dec.indexOf('http') === 0) {
             let streamUrl = dec;
-            if (String(quality || 'high').toLowerCase().includes('320') || String(quality || 'high').toLowerCase().includes('high')) {
+            if (String(quality || 'high').toLowerCase().indexOf('320') !== -1 || String(quality || 'high').toLowerCase().indexOf('high') !== -1) {
               streamUrl = dec.replace('_96.mp4', '_320.mp4').replace('_160.mp4', '_320.mp4').replace('_48.mp4', '_320.mp4');
             }
             const track = toTrack(songData);
@@ -397,29 +337,6 @@
         }
       } catch (_) {}
     }
-
-    // 4. Staging Gateway fallback
-    try {
-      const track = parseTrack(trackId);
-      if (track) {
-        const resolved = await request('/resolve', { track });
-        if (resolved && resolved.streamUrl) {
-          const streamUrl = new URL(resolved.streamUrl, API).toString();
-          return ok({
-            url: streamUrl,
-            headers: {},
-            mimeType: 'audio/mp4',
-            extension: 'mp4',
-            title: resolved.track && resolved.track.title || 'Track',
-            artist: resolved.track && resolved.track.artist || 'Unknown Artist',
-            album: resolved.track && resolved.track.album || '',
-            artwork: resolved.track && resolved.track.image || '',
-            durationSeconds: resolved.track && resolved.track.durationSeconds,
-            quality: resolved.quality || quality || 'high'
-          });
-        }
-      }
-    } catch (_) {}
 
     return fail('No authorised full-length route is available for this track.');
   }

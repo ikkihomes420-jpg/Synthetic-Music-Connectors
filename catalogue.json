@@ -11,8 +11,8 @@
       "version": "1.3.0",
       "releaseTrack": "staging",
       "file": "packages/Synthetiq-Music-Gateway-1.3.0.zip",
-      "sha256": "00a38d38ed2ea6894621cbf763e5e3b3b0b30bd194ac8f6500275c0211cdb88e",
-      "publishedAt": "2026-08-22T17:19:00Z",
+      "sha256": "6ba8464dd8e33b4163365666ce2e9bb865d69e494f16f447a73791ffaca6c72f",
+      "publishedAt": "2026-08-22T17:22:00Z",
       "changelog": [
         "Unified high-fidelity music search and 320kbps full-length stream resolution.",
         "Added in-module DES-ECB cipher hardware decryption for direct Akamai CDN MP4 audio.",
