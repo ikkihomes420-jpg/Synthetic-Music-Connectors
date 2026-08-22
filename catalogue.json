@@ -8,12 +8,13 @@
       "moduleIdentity": "SP-MUS-3006-MUSIC-GATEWAY",
       "moduleIdentityNumber": 3006,
       "contentType": "music",
-      "version": "1.3.0",
+      "version": "1.4.0",
       "releaseTrack": "staging",
-      "file": "packages/Synthetiq-Music-Gateway-1.3.0.zip",
-      "sha256": "6ba8464dd8e33b4163365666ce2e9bb865d69e494f16f447a73791ffaca6c72f",
-      "publishedAt": "2026-08-22T17:22:00Z",
+      "file": "packages/Synthetiq-Music-Gateway-1.4.0.zip",
+      "sha256": "9fcd74364c23fdc7368514caa653a9c65deeb3c218f5033d845101109add712b",
+      "publishedAt": "2026-08-22T17:34:00Z",
       "changelog": [
+        "Fixed seek bar and stream duration resolution.",
         "Unified high-fidelity music search and 320kbps full-length stream resolution.",
         "Added in-module DES-ECB cipher hardware decryption for direct Akamai CDN MP4 audio.",
         "Added multi-mirror failover and automatic base64 catalogue track decoding."
