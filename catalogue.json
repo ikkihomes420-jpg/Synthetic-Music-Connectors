@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "repository": "Synthetic Music Connectors",
+  "modules": [
+    {
+      "moduleId": "synthetiq-music-gateway-v1",
+      "moduleFamilyId": "synthetiq_music_gateway",
+      "moduleIdentity": "SP-MUS-3006-MUSIC-GATEWAY",
+      "moduleIdentityNumber": 3006,
+      "contentType": "music",
+      "version": "1.2.2",
+      "releaseTrack": "staging",
+      "file": "packages/Synthetiq-Music-Gateway-1.2.2.zip",
+      "sha256": "502b9335c86775709adb7d6b9d5e551dd2624185a875fdff625629d055abc829",
+      "publishedAt": "2026-08-22T16:37:00Z",
+      "changelog": [
+        "Initial staging release of the Synthetiq Music Gateway connector.",
+        "Routes discovery and playback through the Synthetiq Music Gateway.",
+        "Offline downloads are deliberately unavailable in this staging release."
+      ],
+      "presentation": {
+        "category": "Music",
+        "purpose": "Music connector",
+        "recommended": false,
+        "language": "Multi-language"
+      }
+    }
+  ]
+}
