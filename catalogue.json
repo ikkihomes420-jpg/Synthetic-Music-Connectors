@@ -21,8 +21,31 @@
       ],
       "presentation": {
         "category": "Music",
-        "purpose": "Music connector",
+        "purpose": "Primary music connector",
         "recommended": true,
+        "language": "Multi-language"
+      }
+    },
+    {
+      "moduleId": "freefy-music-v1",
+      "moduleFamilyId": "freefy_music",
+      "moduleIdentity": "SP-MUS-3010-FREEFY",
+      "moduleIdentityNumber": 3010,
+      "contentType": "music",
+      "version": "1.0.0",
+      "releaseTrack": "production",
+      "file": "packages/Freefy-Music-1.0.0.zip",
+      "sha256": "dd9b90e6bd80a5c5d250555ee7cead5fb67addbf3faccd3b4a02a0eb5caab8dd",
+      "publishedAt": "2026-08-22T18:38:00Z",
+      "changelog": [
+        "Worldwide YouTube Music search aggregator integration.",
+        "High-fidelity 320kbps full-length playback with mirror fallbacks.",
+        "Offline playback support."
+      ],
+      "presentation": {
+        "category": "Music",
+        "purpose": "Worldwide fallback music connector",
+        "recommended": false,
         "language": "Multi-language"
       }
     }
