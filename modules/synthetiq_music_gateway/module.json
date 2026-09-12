@@ -1,21 +1,25 @@
 {
   "id": "synthetiq-music-gateway-v1",
   "name": "Synthetiq Music Gateway",
-  "description": "Unified music search and 320kbps full-length playback with DES decryption, Akamai CDN streaming, and multi-mirror fallbacks.",
+  "description": "Unified music search and playback: YouTube Music full catalog as primary source with radio, charts, and album browse; ListenFree/JioSaavn fallbacks with DES decryption.",
   "type": "client",
   "contentType": "music",
   "contractVersion": 4,
   "formatVersion": 3,
-  "moduleVersion": "1.4.0",
+  "moduleVersion": "1.5.0",
   "moduleFamilyId": "synthetiq_music_gateway",
   "moduleIdentity": "SP-MUS-3006-MUSIC-GATEWAY",
   "moduleIdentityNumber": 3006,
   "releaseTrack": "staging",
-  "baseUrl": "https://backend.listenfree.in",
+  "baseUrl": "https://music.youtube.com",
   "config": {
     "capabilities": {
       "music_home_v1": true,
-      "local_listening_stats_v1": true
+      "local_listening_stats_v1": true,
+      "search_filters_v1": true,
+      "album_view_v1": true,
+      "playlist_view_v1": true,
+      "radio_v1": true
     },
     "runtime": {
       "mode": "local",
@@ -24,8 +28,8 @@
     "caps": {
       "homeMaxResults": 24,
       "maxResponseBytes": 524288,
-      "timeoutMs": 12000,
-      "maxConcurrentRequests": 2
+      "timeoutMs": 10000,
+      "maxConcurrentRequests": 4
     },
     "playbackMode": "full",
     "allowOfflineDownload": true
