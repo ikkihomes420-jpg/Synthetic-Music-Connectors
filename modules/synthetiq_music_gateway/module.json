@@ -1,7 +1,7 @@
 {
   "id": "synthetiq-music-gateway-v1",
   "name": "Synthetiq Music Gateway",
-  "description": "Unified music connector: YouTube Music full catalog with resilient streaming (mirror failover pools), real radio recommendations, artist pages, albums, playlists, lyrics, genre charts, and search filters; ListenFree/JioSaavn fallbacks.",
+  "description": "Unified music search and 320kbps full-length playback with DES decryption, Akamai CDN streaming, and multi-mirror fallbacks.",
   "type": "client",
   "contentType": "music",
   "contractVersion": 4,
@@ -38,5 +38,15 @@
     "playbackMode": "full",
     "allowOfflineDownload": true
   },
-  "moduleStatus": "production"
+  "moduleStatus": "production",
+  "capabilities": {
+    "music_home_v1": true,
+    "local_listening_stats_v1": true
+  },
+  "caps": {
+    "homeMaxResults": 24,
+    "maxResponseBytes": 524288,
+    "timeoutMs": 12000,
+    "maxConcurrentRequests": 2
+  }
 }
