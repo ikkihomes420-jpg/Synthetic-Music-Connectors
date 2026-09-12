@@ -10,7 +10,7 @@
   "moduleFamilyId": "synthetiq_music_gateway",
   "moduleIdentity": "SP-MUS-3006-MUSIC-GATEWAY",
   "moduleIdentityNumber": 3006,
-  "releaseTrack": "staging",
+  "releaseTrack": "production",
   "baseUrl": "https://music.youtube.com",
   "config": {
     "capabilities": {
@@ -38,5 +38,5 @@
     "playbackMode": "full",
     "allowOfflineDownload": true
   },
-  "moduleStatus": "staging"
+  "moduleStatus": "production"
 }
