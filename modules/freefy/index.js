@@ -1,272 +1,74 @@
 (() => {
   'use strict';
 
-  const YT_SEARCH_URL = 'https://music.youtube.com/youtubei/v1/search';
-  const LISTENFREE_MIRRORS = [
-    'https://backend.listenfree.in/api',
-    'https://backend2.listenfree.in/api',
-    'https://music-api.albatross0071.workers.dev/api'
-  ];
-  const REQUEST_TIMEOUT_MS = 10000;
-
-  function ok(data) { return { ok: true, data: JSON.stringify(data) }; }
-  function fail(message) { return { ok: false, error: { message: String(message || 'Source unavailable') } }; }
-
-  async function postJson(url, body) {
-    const headers = {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
-    };
-    if (typeof fetchv2 === 'function') {
-      const res = await fetchv2(url, headers, 'POST', JSON.stringify(body));
-      return typeof res === 'string' ? JSON.parse(res) : res;
-    }
-    const controller = typeof AbortController === 'function' ? new AbortController() : null;
-    const timer = controller ? setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS) : null;
-    try {
-      const res = await fetch(url, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(body),
-        signal: controller ? controller.signal : undefined
-      });
-      return await res.json();
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
-  }
-
-  async function getJson(url) {
-    const headers = {
-      'Accept': 'application/json',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
-    };
-    if (typeof fetchv2 === 'function') {
-      const res = await fetchv2(url, headers, 'GET', null);
-      return typeof res === 'string' ? JSON.parse(res) : res;
-    }
-    const controller = typeof AbortController === 'function' ? new AbortController() : null;
-    const timer = controller ? setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS) : null;
-    try {
-      const res = await fetch(url, { method: 'GET', headers, signal: controller ? controller.signal : undefined });
-      return await res.json();
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
-  }
-
-  async function searchResults(query, page) {
-    const term = String(query || '').trim();
-    if (!term) return ok([]);
-
-    try {
-      const payload = {
-        context: { client: { clientName: 'WEB_REMIX', clientVersion: '1.20240101.01.00', hl: 'en', gl: 'US' } },
-        query: term,
-        params: 'EgWKAQIIAWoKEAkQBRAKEAMQBA==' // songs only
-      };
-      const data = await postJson(YT_SEARCH_URL, payload);
-      const tracks = [];
-      const sectionList = data.contents?.tabbedSearchResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents || [];
-
-      for (const section of sectionList) {
-        const shelf = section.musicShelfRenderer || section.musicCardShelfRenderer;
-        if (!shelf || !shelf.contents) continue;
-
-        for (const item of shelf.contents) {
-          const flex = item.musicResponsiveListItemRenderer;
-          if (!flex) continue;
-
-          let videoId = flex.playlistItemData?.videoId || flex.doubleTapCommand?.watchEndpoint?.videoId;
-          if (!videoId) {
-            videoId = flex.overlay?.musicItemThumbnailOverlayRenderer?.content?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint?.videoId;
-          }
-          if (!videoId) continue;
-
-          const titleRuns = flex.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs;
-          const title = titleRuns?.[0]?.text || 'Track';
-
-          const subtitleRuns = flex.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
-          let artist = 'Unknown Artist';
-          let album;
-          let durationSeconds;
-
-          if (subtitleRuns.length > 0) {
-            artist = subtitleRuns[0]?.text?.trim() || 'Unknown Artist';
-            if (subtitleRuns.length >= 3 && subtitleRuns[1]?.text?.trim() === '•') {
-              album = subtitleRuns[2]?.text?.trim();
-            }
-            for (let i = subtitleRuns.length - 1; i >= 0; i--) {
-              const match = String(subtitleRuns[i]?.text || '').trim().match(/^(\d+):(\d+)$/);
-              if (match) {
-                durationSeconds = (parseInt(match[1], 10) * 60) + parseInt(match[2], 10);
-                break;
-              }
-            }
-          }
-
-          let imageUrl;
-          const thumbs = flex.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails;
-          if (thumbs && thumbs.length) {
-            imageUrl = thumbs[thumbs.length - 1].url?.replace(/=w\d+-h\d+.*$/, '=w544-h544-l90-rj');
-          }
-
-          tracks.push({
-            id: 'freefy:' + videoId,
-            href: 'freefy:' + videoId,
-            type: 'track',
-            title,
-            artist,
-            album,
-            image: imageUrl,
-            durationSeconds
-          });
-        }
-      }
-
-      if (tracks.length > 0) return ok(tracks);
-    } catch (_) {}
-
-    // Fallback to ListenFree mirrors
-    for (const mirror of LISTENFREE_MIRRORS) {
+  const YT_API = 'https://music.youtube.com/youtubei/v1';
+  const CACHE = new Map();
+  const MIRRORS = {
+    invidious: ['https://iv.datura.network/api/v1', 'https://iv.nboej.de/api/v1', 'https://invidious.nerdvpn.de/api/v1', 'https://invidious.privacyredirect.com/api/v1', 'https://invidious.jing.yn.cn/api/v1'],
+    piped: ['https://pipedapi.moomoo.me', 'https://pipedapi.kavin.rocks', 'https://pipedapi.adminforge.de', 'https://pipedapi.reallyaweso.me', 'https://pipedapi.drgns.space'],
+    listenfree: ['https://backend.listenfree.in/api', 'https://backend2.listenfree.in/api', 'https://music-api.albatross00731.workers.dev/api']
+  };
+  const health = new Map();
+  const timeout = 8000;
+  const context = { client: { clientName: 'WEB_REMIX', clientVersion: '1.20240101.01.00', hl: 'en', gl: 'US' } };
+  const ok = data => ({ ok: true, data: JSON.stringify(data) });
+  const fail = message => ({ ok: false, error: { message: String(message || 'Source unavailable') } });
+  const now = () => Date.now();
+  const cached = (key, ttl) => { const item = CACHE.get(key); return item && now() - item.time < ttl ? item.value : null; };
+  const remember = (key, value) => { CACHE.set(key, { time: now(), value }); return value; };
+  const request = async (url, options = {}, retries = 2) => {
+    let last;
+    for (let attempt = 0; attempt <= retries; attempt += 1) {
+      const controller = typeof AbortController === 'function' ? new AbortController() : null;
+      const timer = controller ? setTimeout(() => controller.abort(), timeout * (attempt + 1)) : null;
       try {
-        const url = mirror + '/search/songs?query=' + encodeURIComponent(term) + '&limit=20';
-        const res = await getJson(url);
-        const results = res?.data?.results || [];
-        if (results.length > 0) {
-          const tracks = results.map(r => ({
-            id: 'freefy:' + (r.id || ''),
-            href: 'freefy:' + (r.id || ''),
-            type: 'track',
-            title: String(r.name || r.title || 'Track'),
-            artist: String(r.primaryArtists || r.artists?.primary?.[0]?.name || 'Unknown Artist'),
-            album: r.album?.name || undefined,
-            image: Array.isArray(r.image) ? r.image[r.image.length - 1]?.url : r.image,
-            durationSeconds: Number(r.duration) || undefined
-          }));
-          return ok(tracks);
-        }
-      } catch (_) {}
+        const response = await fetch(url, { ...options, signal: controller?.signal, headers: { Accept: 'application/json', 'Accept-Encoding': 'gzip, deflate', ...(options.headers || {}) } });
+        if (response.status === 429) throw new Error('rate limited');
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return await response.json();
+      } catch (error) { last = error; if (attempt < retries) await new Promise(resolve => setTimeout(resolve, 250 * (2 ** attempt))); }
+      finally { if (timer) clearTimeout(timer); }
     }
-
+    throw last;
+  };
+  const post = (url, body) => request(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const rank = url => health.get(url)?.latency || Number.MAX_SAFE_INTEGER;
+  const mark = (url, latency, good) => health.set(url, { latency, failures: good ? 0 : (health.get(url)?.failures || 0) + 1, checked: now() });
+  const mirrors = pool => MIRRORS[pool].filter(url => (health.get(url)?.failures || 0) < 3).sort((a, b) => rank(a) - rank(b));
+  const cleanId = value => String(value || '').replace(/^(freefy|yt|youtube|song|track):/i, '').trim();
+  const image = value => Array.isArray(value) ? value[value.length - 1]?.url : value;
+  const text = value => Array.isArray(value) ? value.map(item => item.text || '').join('') : String(value || '');
+  const videoId = item => item?.videoId || item?.playlistItemData?.videoId || item?.doubleTapCommand?.watchEndpoint?.videoId || item?.overlay?.musicItemThumbnailOverlayRenderer?.content?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint?.videoId;
+  const mapTrack = item => {
+    const id = videoId(item) || item?.id;
+    if (!id) return null;
+    const columns = item?.flexColumns || [];
+    const runs = columns[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
+    const sub = columns[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
+    return { id: `freefy:${id}`, href: `freefy:${id}`, type: 'track', title: text(runs[0]?.text || item?.title) || 'Track', artist: text(sub[0]?.text || item?.artist) || 'Unknown Artist', album: text(sub[2]?.text || item?.album) || undefined, image: image(item?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || item?.image), durationSeconds: Number(item?.lengthSeconds || item?.duration) || undefined };
+  };
+  const extractSearch = data => {
+    const contents = data?.contents?.tabbedSearchResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents || [];
+    return contents.flatMap(section => (section.musicShelfRenderer?.contents || section.musicCardShelfRenderer?.contents || []).map(mapTrack).filter(Boolean));
+  };
+  async function searchResults(query, page = 0, options = {}) {
+    const term = String(query || '').trim(); if (!term) return ok([]);
+    const key = `search:${term}:${page}:${JSON.stringify(options)}`; const hit = cached(key, 300000); if (hit) return ok(hit);
+    try { const data = await post(`${YT_API}/search?alt=json`, { context, query: term, params: options.params }); const tracks = extractSearch(data); if (tracks.length) return ok(remember(key, tracks)); } catch (_) {}
+    for (const base of mirrors('listenfree')) try { const data = await request(`${base}/search/songs?query=${encodeURIComponent(term)}&limit=20&page=${page}`); const rows = data?.data?.results || data?.results || []; if (rows.length) return ok(remember(key, rows.map(row => ({ id: `freefy:${row.id}`, href: `freefy:${row.id}`, type: 'track', title: row.name || row.title || 'Track', artist: row.primaryArtists || row.artists?.primary?.[0]?.name || 'Unknown Artist', album: row.album?.name, image: image(row.image), durationSeconds: Number(row.duration) || undefined })))); } catch (_) {}
     return ok([]);
   }
-
-  async function extractAudioUrl(trackId, quality) {
-    const cleanId = String(trackId || '').replace(/^(freefy|yt|song|track):/, '').trim();
-
-    // 1. Try ListenFree mirrors for direct 320kbps MP4 Akamai CDN stream
-    for (const mirror of LISTENFREE_MIRRORS) {
-      try {
-        const res = await getJson(mirror + '/songs/' + cleanId);
-        const songData = Array.isArray(res?.data) ? res.data[0] : res?.data;
-        if (songData && Array.isArray(songData.downloadUrl)) {
-          let stream320 = null;
-          let fallback = null;
-          for (const d of songData.downloadUrl) {
-            if (d?.url) {
-              if (String(d.quality).includes('320')) stream320 = d.url;
-              fallback = d.url;
-            }
-          }
-          const best = stream320 || fallback;
-          if (best) {
-            return ok({
-              url: best,
-              headers: {},
-              mimeType: 'audio/mp4',
-              extension: 'mp4',
-              title: songData.name || 'Track',
-              artist: songData.primaryArtists || 'Unknown Artist',
-              album: songData.album?.name || '',
-              artwork: Array.isArray(songData.image) ? songData.image[songData.image.length - 1]?.url : songData.image || '',
-              durationSeconds: Number(songData.duration) || undefined,
-              quality: quality || 'high'
-            });
-          }
-        }
-      } catch (_) {}
-    }
-
-    // 2. Fallback to search query if trackId is not direct
-    try {
-      const searchRes = await searchResults(cleanId, 0);
-      if (searchRes.ok) {
-        const items = JSON.parse(searchRes.data);
-        if (items.length > 0 && items[0].id !== trackId) {
-          return extractAudioUrl(items[0].id, quality);
-        }
-      }
-    } catch (_) {}
-
-    return fail('No full-length audio stream is available for this track.');
+  const choose = (formats, quality) => { const audio = formats.filter(format => format.url && (!format.mimeType || format.mimeType.startsWith('audio/'))); const target = Number(String(quality || '320').replace(/\D/g, '')) || 320; return audio.sort((a, b) => Math.abs((Number(b.bitrate || 0) / 1000) - target) - Math.abs((Number(a.bitrate || 0) / 1000) - target))[0]; };
+  async function extractAudioUrl(trackId, quality = '320') {
+    const id = cleanId(trackId); const key = `audio:${id}:${quality}`; const hit = cached(key, 180000); if (hit) return ok(hit);
+    try { const data = await post(`${YT_API}/player?alt=json`, { context, videoId: id, contentCheckOk: true, racyCheckOk: true }); const format = choose(data?.streamingData?.adaptiveFormats || [], quality); if (format?.url) return ok(remember(key, { url: format.url, mimeType: format.mimeType || 'audio/mp4', quality, title: data.videoDetails?.title, artist: data.videoDetails?.author })); } catch (_) {}
+    for (const base of mirrors('invidious')) try { const started = now(); const data = await request(`${base}/videos/${encodeURIComponent(id)}`); const format = choose(data?.adaptiveFormats || data?.formatStreams || [], quality); if (format?.url) { mark(base, now() - started, true); return ok(remember(key, { url: format.url, mimeType: format.type || 'audio/mp4', quality })); } } catch (_) { mark(base, timeout, false); }
+    for (const base of mirrors('piped')) try { const started = now(); const data = await request(`${base}/streams/${encodeURIComponent(id)}`); const format = choose(data?.audioStreams || [], quality); if (format?.url) { mark(base, now() - started, true); return ok(remember(key, { url: format.url, mimeType: format.mimeType || 'audio/mp4', quality })); } } catch (_) { mark(base, timeout, false); }
+    for (const base of mirrors('listenfree')) try { const data = await request(`${base}/songs/${encodeURIComponent(id)}`); const rows = data?.data?.[0]?.downloadUrl || data?.data?.downloadUrl || []; const format = choose(rows, quality) || rows[0]; if (format?.url) return ok(remember(key, { url: format.url, mimeType: 'audio/mp4', quality })); } catch (_) {}
+    return fail('Content unavailable');
   }
-
-  async function extractDetails(id) {
-    const cleanId = String(id || '').replace(/^(album|playlist|freefy):/, '').trim();
-    for (const mirror of LISTENFREE_MIRRORS) {
-      try {
-        const res = await getJson(mirror + '/albums?id=' + encodeURIComponent(cleanId));
-        const data = res?.data;
-        if (data) {
-          const tracks = (data.songs || []).map(s => ({
-            id: 'freefy:' + s.id,
-            href: 'freefy:' + s.id,
-            type: 'track',
-            title: String(s.name || 'Track'),
-            artist: String(s.primaryArtists || 'Unknown Artist'),
-            album: data.name,
-            image: Array.isArray(s.image) ? s.image[s.image.length - 1]?.url : s.image,
-            durationSeconds: Number(s.duration) || undefined
-          }));
-          return ok({
-            id: cleanId,
-            title: String(data.name || 'Album'),
-            artist: String(data.primaryArtists || 'Various Artists'),
-            image: Array.isArray(data.image) ? data.image[data.image.length - 1]?.url : data.image,
-            year: data.year ? String(data.year) : undefined,
-            tracks
-          });
-        }
-      } catch (_) {}
-    }
-    return fail('Album details unavailable.');
-  }
-
-  async function extractTracks(containerId) {
-    const details = await extractDetails(containerId);
-    if (!details.ok) return details;
-    const parsed = JSON.parse(details.data);
-    return ok(parsed.tracks || []);
-  }
-
-  async function homeSections(page) {
-    if (Number(page) > 0) return ok([]);
-    const sections = [];
-    for (const row of [
-      { title: 'Trending Global Hits', query: 'top hits 2026' },
-      { title: 'Popular Hip-Hop & Rap', query: 'drake hip hop' },
-      { title: 'New Releases', query: 'new release songs' }
-    ]) {
-      const res = await searchResults(row.query, 0);
-      if (res.ok) {
-        const items = JSON.parse(res.data);
-        if (items.length) sections.push({ title: row.title, type: 'track', items: items.slice(0, 12) });
-      }
-    }
-    return sections.length ? ok(sections) : fail('Home sections unavailable.');
-  }
-
-  async function getRelatedTracks(seedId) {
-    const res = await searchResults('similar music', 0);
-    return res;
-  }
-
-  globalThis.searchResults = searchResults;
-  globalThis.homeSections = homeSections;
-  globalThis.extractDetails = extractDetails;
-  globalThis.extractTracks = extractTracks;
-  globalThis.extractAudioUrl = extractAudioUrl;
-  globalThis.getRelatedTracks = getRelatedTracks;
+  async function extractDetails(id) { const clean = cleanId(id); const key = `details:${clean}`; const hit = cached(key, 3600000); if (hit) return ok(hit); for (const base of mirrors('listenfree')) try { const data = await request(`${base}/albums?id=${encodeURIComponent(clean)}`); if (data?.data) return ok(remember(key, data.data)); } catch (_) {} return fail('Album details unavailable'); }
+  async function extractTracks(id) { const details = await extractDetails(id); if (!details.ok) return details; return ok(JSON.parse(details.data).tracks || []); }
+  async function homeSections(page = 0) { if (Number(page) > 0) return ok([]); const rows = await Promise.all(['trending music', 'new music releases', 'popular hip hop'].map(query => searchResults(query, 0))); return ok(rows.filter(row => row.ok).map((row, index) => ({ title: ['Trending', 'New Releases', 'Popular'][index], type: 'track', items: JSON.parse(row.data).slice(0, 12) }))); }
+  globalThis.searchResults = searchResults; globalThis.homeSections = homeSections; globalThis.extractDetails = extractDetails; globalThis.extractTracks = extractTracks; globalThis.extractAudioUrl = extractAudioUrl;
 })();
