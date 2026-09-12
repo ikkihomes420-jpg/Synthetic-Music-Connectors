@@ -11,7 +11,7 @@
       "version": "1.6.0",
       "releaseTrack": "production",
       "file": "packages/Synthetiq-Music-Gateway-1.6.0.zip",
-      "sha256": "343d13b3cd1822a6c9afc6db5957a68586bf4c1c54ce017014059f028a151eea",
+      "sha256": "7f4cc297afb1969eba51aff3b56ece180e750d1f864204085b0b97d1829e9878",
       "publishedAt": "2026-09-12T23:59:00Z",
       "changelog": [
         "Freefy merged into the gateway; YouTube Music full catalog is now the primary source.",
