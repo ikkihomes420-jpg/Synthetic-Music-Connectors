@@ -70,5 +70,110 @@
   async function extractDetails(id) { const clean = cleanId(id); const key = `details:${clean}`; const hit = cached(key, 3600000); if (hit) return ok(hit); for (const base of mirrors('listenfree')) try { const data = await request(`${base}/albums?id=${encodeURIComponent(clean)}`); if (data?.data) return ok(remember(key, data.data)); } catch (_) {} return fail('Album details unavailable'); }
   async function extractTracks(id) { const details = await extractDetails(id); if (!details.ok) return details; return ok(JSON.parse(details.data).tracks || []); }
   async function homeSections(page = 0) { if (Number(page) > 0) return ok([]); const rows = await Promise.all(['trending music', 'new music releases', 'popular hip hop'].map(query => searchResults(query, 0))); return ok(rows.filter(row => row.ok).map((row, index) => ({ title: ['Trending', 'New Releases', 'Popular'][index], type: 'track', items: JSON.parse(row.data).slice(0, 12) }))); }
-  globalThis.searchResults = searchResults; globalThis.homeSections = homeSections; globalThis.extractDetails = extractDetails; globalThis.extractTracks = extractTracks; globalThis.extractAudioUrl = extractAudioUrl;
+
+  const browse = async browseId => post(`${YT_API}/browse?alt=json`, { context, browseId });
+  const shelfItems = data => {
+    const tabs = data?.contents?.singleColumnBrowseResultsRenderer?.tabs || data?.contents?.twoColumnBrowseResultsRenderer?.tabs || [];
+    const sections = tabs[0]?.tabRenderer?.content?.sectionListRenderer?.contents || data?.contents?.sectionListRenderer?.contents || [];
+    return sections.flatMap(section => section.musicShelfRenderer?.contents || section.musicCarouselShelfRenderer?.contents?.flatMap(shelf => shelf.musicResponsiveListItemRenderer ? [shelf] : shelf.musicTwoRowItemRenderer ? [shelf] : []) || []);
+  };
+  const parseListItem = item => {
+    const columns = item?.musicResponsiveListItemRenderer?.flexColumns || item?.musicTwoRowItemRenderer;
+    if (!columns) return null;
+    const rows = Array.isArray(columns) ? columns : columns.title ? [{ ...columns.title, musicResponsiveListItemFlexColumnRenderer: columns.title }, columns.subtitle && { musicResponsiveListItemFlexColumnRenderer: { text: columns.subtitle } }].filter(Boolean) : [];
+    const runsOf = column => column?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
+    const id = item?.musicResponsiveListItemRenderer?.playlistItemData?.videoId || item?.musicResponsiveListItemRenderer?.overlay?.musicItemThumbnailOverlayRenderer?.content?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint?.videoId || item?.musicTwoRowItemRenderer?.navigationEndpoint?.watchEndpoint?.videoId || item?.musicTwoRowItemRenderer?.navigationEndpoint?.browseEndpoint?.browseId;
+    if (!id) return null;
+    const titleRuns = runsOf(rows[0]);
+    const subRuns = runsOf(rows[1]);
+    const thumbs = item?.musicResponsiveListItemRenderer?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || item?.musicTwoRowItemRenderer?.thumbnailRenderer?.musicThumbnailRenderer?.thumbnail?.thumbnails;
+    const isBrowse = id.startsWith('MPRE') || id.startsWith('MPUC') || id.startsWith('VL') || id.startsWith('MP') || id.startsWith('UC');
+    return { id: `freefy:${id}`, href: `freefy:${id}`, type: isBrowse ? 'collection' : 'track', title: text(titleRuns[0]?.text) || 'Track', artist: text(subRuns[0]?.text) || 'Unknown Artist', album: subRuns.length > 2 ? text(subRuns[2]?.text) : undefined, image: image(thumbs), durationSeconds: (() => { const m = text(subRuns[subRuns.length - 1]?.text).match(/(\d+):(\d+)/); return m ? Number(m[1]) * 60 + Number(m[2]) : undefined; })() };
+  };
+
+  async function getRadio(seedId) {
+    const seed = cleanId(seedId); if (!seed) return fail('Seed track required');
+    const key = `radio:${seed}`; const hit = cached(key, 1800000); if (hit) return ok(hit);
+    try {
+      const data = await post(`${YT_API}/next?alt=json`, { context, videoId: seed, playlistId: `RDAMVM${seed}` });
+      const panel = data?.contents?.singleColumnMusicWatchNextResultsRenderer?.tabbedRenderer?.watchNextTabbedResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.musicQueueRenderer?.content?.playlistPanelRenderer;
+      const items = (panel?.contents || []).map(entry => parseListItem(entry.playlistPanelVideoRenderer || entry)).filter(Boolean);
+      if (items.length) return ok(remember(key, items));
+    } catch (_) {}
+    const seedRes = await searchResults(seed, 0); const first = seedRes.ok ? JSON.parse(seedRes.data)[0] : null;
+    return first ? getRadio(first.id) : fail('Radio unavailable');
+  }
+
+  async function getAlbum(albumIdOrQuery) {
+    const clean = cleanId(albumIdOrQuery); const key = `album:${clean}`; const hit = cached(key, 3600000); if (hit) return ok(hit);
+    let browseId = clean.startsWith('MPRE') ? clean : null;
+    if (!browseId) {
+      try {
+        const data = await post(`${YT_API}/search?alt=json`, { context, query: clean, params: 'EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D' });
+        const first = (data?.contents?.tabbedSearchResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents || []).flatMap(section => section.musicShelfRenderer?.contents || [])[0];
+        const found = first?.playlistItemData?.videoId ? null : first?.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs?.[0]?.navigationEndpoint?.browseEndpoint?.browseId;
+        if (found) browseId = found;
+      } catch (_) {}
+    }
+    if (browseId) {
+      try {
+        const data = await browse(browseId);
+        const items = shelfItems(data).map(parseListItem).filter(Boolean);
+        const header = data?.header?.musicDetailHeaderRenderer || data?.header?.musicImmersiveHeaderRenderer;
+        const album = { id: `freefy:${browseId}`, href: `freefy:${browseId}`, type: 'album', title: text(header?.title?.runs) || 'Album', artist: text(header?.subtitle?.runs?.[0]?.text) || 'Unknown Artist', year: text(header?.subtitle?.runs?.map(run => run.text).find(t => /^\d{4}/.test(t || ''))) || undefined, image: image(header?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails), tracks: items };
+        if (album.tracks.length) return ok(remember(key, album));
+      } catch (_) {}
+    }
+    const details = await extractDetails(albumIdOrQuery);
+    return details.ok ? details : fail('Album unavailable');
+  }
+
+  async function getArtist(artistId) {
+    const clean = cleanId(artistId); const key = `artist:${clean}`; const hit = cached(key, 3600000); if (hit) return ok(hit);
+    try {
+      const data = await browse(clean);
+      const header = data?.header?.musicImmersiveHeaderRenderer || data?.header?.musicDetailHeaderRenderer;
+      const shelves = data?.contents?.singleColumnBrowseResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents || [];
+      const artist = { id: `freefy:${clean}`, href: `freefy:${clean}`, type: 'artist', name: text(header?.title?.runs) || 'Artist', image: image(header?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails), description: text(header?.description?.runs) || undefined, sections: [] };
+      for (const shelf of shelves) {
+        const renderer = shelf.musicCarouselShelfRenderer;
+        const title = text(renderer?.header?.musicCarouselShelfBasicHeaderRenderer?.title?.runs);
+        const items = (renderer?.contents || []).map(parseListItem).filter(Boolean);
+        if (title && items.length) artist.sections.push({ title, type: items[0].type === 'collection' ? 'collection' : 'track', items });
+      }
+      if (artist.sections.length) return ok(remember(key, artist));
+    } catch (_) {}
+    return fail('Artist unavailable');
+  }
+
+  const GENRES = { pop: 'zgUgcG9w', hiphop: 'zgUdG9w', dance: 'zgUgZGFuY2U', rock: 'zgUgcm9jaw', lofi: 'zgUgbG9maQ', jazz: 'zgUgamF6eg', classical: 'zgUgY2xhc3NpY2Fs', latin: 'zgUgbGF0aW4', kpop: 'zgUga3BvcA', afrobeats: 'zgUgYWZyb2JlYXRz', rnb: 'zgUgcm5i', workout: 'zgUgd29ya291dA', chill: 'zgUgY2hpbGw', country: 'zgUgY291bnRyeQ', metal: 'zgUgbWV0YWw', indie: 'zgUgaW5kaWU' };
+  async function getGenreCharts(genreKey, page = 0) {
+    if (Number(page) > 0) return ok([]);
+    const params = GENRES[String(genreKey || 'pop').toLowerCase()]; if (!params) return fail('Unknown genre');
+    const key = `charts:${genreKey}`; const hit = cached(key, 900000); if (hit) return ok(hit);
+    try {
+      const data = await post(`${YT_API}/search?alt=json`, { context, query: '', params: `${params}IAwoAEAM` });
+      const items = (data?.contents?.tabbedSearchResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents || []).flatMap(section => section.musicShelfRenderer?.contents || []).map(parseListItem).filter(Boolean);
+      return ok(remember(key, items));
+    } catch (_) { return fail('Charts unavailable'); }
+  }
+  async function getLyrics(trackId) {
+    const seed = cleanId(trackId); if (!seed) return fail('Track required');
+    const key = `lyrics:${seed}`; const hit = cached(key, 86400000); if (hit) return ok(hit);
+    try {
+      const next = await post(`${YT_API}/next?alt=json`, { context, videoId: seed });
+      const tabs = next?.contents?.singleColumnMusicWatchNextResultsRenderer?.tabbedRenderer?.watchNextTabbedResultsRenderer?.tabs || [];
+      const lyricTab = tabs.find(tab => tab.tabRenderer?.title === 'Lyrics');
+      const params = lyricTab?.tabRenderer?.endpoint?.watchEndpoint?.params;
+      if (params) {
+        const data = await post(`${YT_API}/get_lyrics?alt=json`, { context, videoId: seed, params });
+        const lines = (data?.contents?.segmentedLyricsRenderer?.contents || []).map(segment => segment.lyricRun?.text || '').filter(Boolean);
+        if (lines.length) return ok(remember(key, { lines }));
+      }
+    } catch (_) {}
+    try { const data = await request(`https://lrclib.net/api/search?q=${encodeURIComponent(seed)}`); if (Array.isArray(data) && data[0]?.plainLyrics) return ok(remember(key, { lines: data[0].plainLyrics.split('\n') })); } catch (_) {}
+    return fail('Lyrics unavailable');
+  }
+
+  globalThis.searchResults = searchResults; globalThis.homeSections = homeSections; globalThis.extractDetails = extractDetails; globalThis.extractTracks = extractTracks; globalThis.extractAudioUrl = extractAudioUrl; globalThis.getRadio = getRadio; globalThis.getAlbum = getAlbum; globalThis.getArtist = getArtist; globalThis.getGenreCharts = getGenreCharts; globalThis.getLyrics = getLyrics;
 })();
