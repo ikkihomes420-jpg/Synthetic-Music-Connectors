@@ -8,24 +8,22 @@
       "moduleIdentity": "SP-MUS-3006-MUSIC-GATEWAY",
       "moduleIdentityNumber": 3006,
       "contentType": "music",
-      "version": "1.6.1",
+      "version": "1.7.0",
       "releaseTrack": "production",
-      "file": "packages/Synthetiq-Music-Gateway-1.6.1.zip",
-      "sha256": "1054c87829491c1c3f0062c270e6357f19899c91a4f6742bb5aa748618ebc03c",
-      "publishedAt": "2026-09-13T00:30:00Z",
+      "file": "packages/Synthetiq-Music-Gateway-1.7.0.zip",
+      "sha256": "cad937b7e2793dabd3f9a179cb09e963b20bafa0df7019ecb708592686815d54",
+      "publishedAt": "2026-09-13T01:15:00Z",
       "changelog": [
-        "Freefy merged into the gateway; YouTube Music full catalog is now the primary source.",
-        "Real radio recommendations via YouTube's /next engine (no more random related tracks).",
-        "Artist pages: top tracks, albums, singles, videos, fans-might-also-like.",
-        "Album browse with complete ordered tracklists; playlist loading with queue fallback.",
-        "Lyrics via YouTube native plus LRCLIB fallback (synced timestamps when available).",
-        "16 genre/mood chart sections and advanced search filters (type, date, duration, features, sort).",
-        "Health-checked Invidious/Piped mirror failover pools with latency-based routing.",
-        "TTL caching for search (5 min), metadata (1 h), and stream URLs (3 min)."
+        "Search pagination: YouTube continuation tokens unlock 60+ results (was 26).",
+        "Real YouTube Charts API replaces fake genre text-searches.",
+        "Smart taste-based recommendations: learns from listening history, blends artist radio.",
+        "Parallel continuation loading + aggressive caching for faster, fresher searches.",
+        "Config conflicts fixed: unified caps, increased timeouts to 12s for pagination.",
+        "New capabilities: search_pagination_v1, real_charts_v1, taste_recommendations_v1."
       ],
       "presentation": {
         "category": "Music",
-        "purpose": "Primary music connector",
+        "purpose": "Primary music connector with smart search and taste learning",
         "recommended": true,
         "language": "Multi-language"
       }
