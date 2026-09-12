@@ -8,17 +8,19 @@
       "moduleIdentity": "SP-MUS-3006-MUSIC-GATEWAY",
       "moduleIdentityNumber": 3006,
       "contentType": "music",
-      "version": "1.7.2",
+      "version": "1.8.0",
       "releaseTrack": "production",
-      "file": "packages/Synthetiq-Music-Gateway-1.7.2.zip",
-      "sha256": "de066d6ea344fd5e58ea19d4f0a57666893f34fa201d67480ab732ef761f6d19",
-      "publishedAt": "2026-09-13T02:30:00Z",
+      "file": "packages/Synthetiq-Music-Gateway-1.8.0.zip",
+      "sha256": "908e5bb5457b062731ee2f39c25de391a282d169ea4437869b248cf8b42dac7f",
+      "publishedAt": "2026-09-13T03:10:00Z",
       "changelog": [
-        "Concurrent sharded search: songs shard + broad shard fetched in parallel, merged and deduped.",
-        "Stale-while-revalidate caching: repeat searches served in 0ms while refreshing in background.",
-        "LRU cache cap (300 entries) fixes unbounded memory growth.",
-        "Payload slimming: track objects stripped to essential fields (~35% smaller app responses).",
-        "Home page sections served via SWR: 0ms repeat loads."
+        "Self-learning taste engine: implicit play signals from every stream and radio start \u2014 works with zero app changes.",
+        "Persistent-lite profiles: taste survives sessions when storage is available, degrades gracefully to session memory.",
+        "New Releases From Your Artists: monthly-filtered radar shelf on the home page.",
+        "Trending In Your Taste: charts intersected with your artist affinity.",
+        "Search re-ranking by artist affinity; already-played tracks demoted.",
+        "Response budget guard: home payload kept under the app's 512KB cap.",
+        "manifest.json now included in package (contract hygiene with upstream)."
       ],
       "presentation": {
         "category": "Music",
