@@ -3,49 +3,30 @@
   "repository": "Synthetic Music Connectors",
   "modules": [
     {
-      "moduleId": "freefy-music-v1",
-      "moduleFamilyId": "freefy_music",
-      "moduleIdentity": "SP-MUS-3010-FREEFY",
-      "moduleIdentityNumber": 3010,
-      "contentType": "music",
-      "version": "1.0.0",
-      "releaseTrack": "production",
-      "file": "packages/Freefy-Music-1.0.0.zip",
-      "sha256": "dd9b90e6bd80a5c5d250555ee7cead5fb67addbf3faccd3b4a02a0eb5caab8dd",
-      "publishedAt": "2026-08-22T18:38:00Z",
-      "changelog": [
-        "Worldwide YouTube Music search aggregator integration.",
-        "High-fidelity 320kbps full-length playback with mirror fallbacks.",
-        "Offline playback support."
-      ],
-      "presentation": {
-        "category": "Music",
-        "purpose": "Primary music connector",
-        "recommended": true,
-        "language": "Multi-language"
-      }
-    },
-    {
       "moduleId": "synthetiq-music-gateway-v1",
       "moduleFamilyId": "synthetiq_music_gateway",
       "moduleIdentity": "SP-MUS-3006-MUSIC-GATEWAY",
       "moduleIdentityNumber": 3006,
       "contentType": "music",
-      "version": "1.4.0",
-      "releaseTrack": "staging",
-      "file": "packages/Synthetiq-Music-Gateway-1.4.0.zip",
-      "sha256": "9fcd74364c23fdc7368514caa653a9c65deeb3c218f5033d845101109add712b",
-      "publishedAt": "2026-08-22T17:34:00Z",
+      "version": "1.6.0",
+      "releaseTrack": "production",
+      "file": "packages/Synthetiq-Music-Gateway-1.6.0.zip",
+      "sha256": "343d13b3cd1822a6c9afc6db5957a68586bf4c1c54ce017014059f028a151eea",
+      "publishedAt": "2026-09-12T23:59:00Z",
       "changelog": [
-        "Fixed seek bar and stream duration resolution.",
-        "Unified high-fidelity music search and 320kbps full-length stream resolution.",
-        "Added in-module DES-ECB cipher hardware decryption for direct Akamai CDN MP4 audio.",
-        "Added multi-mirror failover and automatic base64 catalogue track decoding."
+        "Freefy merged into the gateway; YouTube Music full catalog is now the primary source.",
+        "Real radio recommendations via YouTube's /next engine (no more random related tracks).",
+        "Artist pages: top tracks, albums, singles, videos, fans-might-also-like.",
+        "Album browse with complete ordered tracklists; playlist loading with queue fallback.",
+        "Lyrics via YouTube native plus LRCLIB fallback (synced timestamps when available).",
+        "16 genre/mood chart sections and advanced search filters (type, date, duration, features, sort).",
+        "Health-checked Invidious/Piped mirror failover pools with latency-based routing.",
+        "TTL caching for search (5 min), metadata (1 h), and stream URLs (3 min)."
       ],
       "presentation": {
         "category": "Music",
-        "purpose": "Staging music connector",
-        "recommended": false,
+        "purpose": "Primary music connector",
+        "recommended": true,
         "language": "Multi-language"
       }
     }
