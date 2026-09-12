@@ -14,13 +14,17 @@
   const ytCached = (key, ttl) => { const item = YT_CACHE.get(key); return item && Date.now() - item.time < ttl ? item.value : null; };
   const ytRemember = (key, value) => { YT_CACHE.set(key, { time: Date.now(), value }); return value; };
   async function ytPost(path, body) {
-    const res = await fetch(YT_API + path + '?alt=json', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36' },
-      body: JSON.stringify({ context: YT_CONTEXT, ...body })
-    });
-    if (!res.ok) throw new Error('YT HTTP ' + res.status);
-    return res.json();
+    const doFetch = async () => {
+      const res = await fetch(YT_API + path + '?alt=json', {
+        method: 'POST',
+        signal: AbortSignal.timeout(8000),
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36' },
+        body: JSON.stringify({ context: YT_CONTEXT, ...body })
+      });
+      if (!res.ok) throw new Error('YT HTTP ' + res.status);
+      return res.json();
+    };
+    try { return await doFetch(); } catch (_) { return doFetch(); }
   }
   function ytText(value) { return Array.isArray(value) ? value.map(item => item.text || '').join('') : String(value || ''); }
   function ytVideoId(item) {
@@ -38,7 +42,12 @@
       videoId = card.title?.runs?.[0]?.navigationEndpoint?.watchEndpoint?.videoId
         || card.buttons?.find(button => button.buttonRenderer?.navigationEndpoint?.watchEndpoint?.videoId)?.buttonRenderer?.navigationEndpoint?.watchEndpoint?.videoId;
     }
-    if (!videoId) return null;
+    // Albums / artists / playlists come back as browse collections, not video IDs
+    const browseId = source.navigationEndpoint?.browseEndpoint?.browseId
+      || source.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs?.[0]?.navigationEndpoint?.browseEndpoint?.browseId
+      || card?.title?.runs?.[0]?.navigationEndpoint?.browseEndpoint?.browseId;
+    if (!videoId && !browseId) return null;
+    const isCollection = !videoId && browseId;
     const columns = source.flexColumns || [];
     const runs = columns[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs
       || (isCard ? card.title?.runs : []);
@@ -46,10 +55,14 @@
       || (isCard ? card.subtitle?.runs : []);
     const thumbs = source.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || card?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails;
     const durationMatch = ytText(sub[sub.length - 1]?.text).match(/(\d+):(\d+)/);
+    const rawId = videoId || browseId;
+    const kind = isCollection
+      ? (browseId.startsWith('MPRE') ? 'album' : browseId.startsWith('MPUC') || browseId.startsWith('UC') ? 'artist' : 'playlist')
+      : 'track';
     return {
-      id: 'synthetiq_music_gateway:yt:' + videoId,
-      href: 'synthetiq_music_gateway:yt:' + videoId,
-      type: 'track',
+      id: kind === 'track' ? 'synthetiq_music_gateway:yt:' + rawId : 'synthetiq_music_gateway:' + kind + ':' + rawId,
+      href: kind === 'track' ? 'synthetiq_music_gateway:yt:' + rawId : 'synthetiq_music_gateway:' + kind + ':' + rawId,
+      type: kind === 'track' ? 'track' : kind,
       title: ytText(runs[0]?.text) || 'Track',
       artist: ytText(sub[0]?.text) || 'Unknown Artist',
       album: sub.length > 2 ? ytText(sub[2]?.text) : undefined,
@@ -118,7 +131,7 @@
   async function mirrorGetJson(url) {
     const started = Date.now();
     try {
-      const res = await fetch(url, { headers: { Accept: 'application/json', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36' } });
+      const res = await fetch(url, { signal: AbortSignal.timeout(5000), headers: { Accept: 'application/json', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36' } });
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
       mirrorMark(url, Date.now() - started, true);
@@ -127,6 +140,16 @@
       mirrorMark(url, 8000, false);
       throw error;
     }
+  }
+  // Race the healthiest mirrors in parallel; first success wins (Promise.any)
+  async function raceMirrors(pool, makeUrl) {
+    const candidates = mirrors(pool).slice(0, 3);
+    if (!candidates.length) throw new Error('no healthy mirrors');
+    return Promise.any(candidates.map(async base => {
+      const data = await mirrorGetJson(makeUrl(base));
+      if (!data) throw new Error('empty response');
+      return { base, data };
+    }));
   }
   const pickAudioFormat = (formats, quality) => {
     const audio = (formats || []).filter(f => f.url && (!f.mimeType || f.mimeType.startsWith('audio/')));
@@ -449,33 +472,34 @@
       const cacheKey = 'audio:' + ytVideo;
       const cachedAudio = ytCached(cacheKey, 180000);
       if (cachedAudio) return ok(cachedAudio);
+      if (ytCached('audioFail:' + ytVideo, 60000)) return fail('This YouTube track could not be streamed.');
       try {
         const audio = await ytAudio(ytVideo, quality);
         if (audio) return ok(ytRemember(cacheKey, audio));
       } catch (_) {}
       // Fallback chain: Invidious pool, then Piped pool (health-checked, latency-routed)
       for (const pool of ['invidious', 'piped']) {
-        for (const base of mirrors(pool)) {
-          try {
-            const path = pool === 'invidious' ? base + '/videos/' + encodeURIComponent(ytVideo) : base + '/streams/' + encodeURIComponent(ytVideo);
-            const data = await mirrorGetJson(path);
-            const format = pickAudioFormat(data?.adaptiveFormats || data?.audioStreams || [], quality);
-            if (format?.url) {
-              return ok(ytRemember(cacheKey, {
-                url: format.url,
-                headers: {},
-                mimeType: format.type || format.mimeType || 'audio/mp4',
-                extension: 'mp4',
-                title: data?.title || 'Track',
-                artist: data?.author || 'Unknown Artist',
-                album: '',
-                artwork: Array.isArray(data?.videoThumbnails) ? data.videoThumbnails.slice(-1)[0]?.url : '',
-                quality: String(Math.round(Number(format.bitrate || 0) / 1000)) + 'kbps'
-              }));
-            }
-          } catch (_) {}
-        }
+        try {
+          const makeUrl = base => pool === 'invidious' ? base + '/videos/' + encodeURIComponent(ytVideo) : base + '/streams/' + encodeURIComponent(ytVideo);
+          const { data } = await raceMirrors(pool, makeUrl);
+          const format = pickAudioFormat(data?.adaptiveFormats || data?.audioStreams || [], quality);
+          if (format?.url) {
+            return ok(ytRemember(cacheKey, {
+              url: format.url,
+              headers: {},
+              mimeType: format.type || format.mimeType || 'audio/mp4',
+              extension: 'mp4',
+              title: data?.title || 'Track',
+              artist: data?.author || 'Unknown Artist',
+              album: '',
+              artwork: Array.isArray(data?.videoThumbnails) ? data.videoThumbnails.slice(-1)[0]?.url : '',
+              quality: String(Math.round(Number(format.bitrate || 0) / 1000)) + 'kbps'
+            }));
+          }
+        } catch (_) {}
       }
+      // Negative cache so failed tracks don't re-walk every mirror for a minute
+      ytRemember('audioFail:' + ytVideo, true);
       return fail('This YouTube track could not be streamed.');
     }
 
@@ -571,7 +595,9 @@
   }
 
   async function extractDetails(id) {
-    const cleanId = String(id || '').replace(/^(album|playlist|synthetiq_music_gateway|synthetiq_music_hub):/, '').trim();
+    // Strip any chain of known ID prefixes: synthetiq_music_gateway:album:MPREb_x -> MPREb_x
+    const KNOWN_PREFIXES = ['synthetiq_music_gateway', 'synthetiq_music_hub', 'freefy', 'album', 'playlist', 'artist', 'yt', 'song', 'track'];
+    const cleanId = String(id || '').split(':').filter(part => part && !KNOWN_PREFIXES.includes(part)).join(':').trim();
 
     // 1. YouTube album via browse (full ordered tracklist)
     if (cleanId.startsWith('MPRE')) {
@@ -580,32 +606,47 @@
       if (cachedAlbum) return ok(cachedAlbum);
       try {
         const data = await ytPost('/browse', { browseId: cleanId });
-        const tabs = data?.contents?.singleColumnBrowseResultsRenderer?.tabs || [];
-        const shelfContents = tabs[0]?.tabRenderer?.content?.sectionListRenderer?.contents || [];
-        const tracks = shelfContents.flatMap(section => section.musicShelfRenderer?.contents || [])
-          .map(item => {
-            const videoId = ytVideoId(item.musicResponsiveListItemRenderer || item);
-            if (!videoId) return null;
-            const columns = item.musicResponsiveListItemRenderer?.flexColumns || [];
-            const runs = columns[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
-            const sub = columns[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
-            return {
-              id: 'synthetiq_music_gateway:yt:' + videoId,
-              href: 'synthetiq_music_gateway:yt:' + videoId,
-              type: 'track',
-              title: ytText(runs[0]?.text) || 'Track',
-              artist: ytText(sub[0]?.text) || 'Unknown Artist',
-              durationSeconds: (() => { const m = ytText(sub[sub.length - 1]?.text).match(/(\d+):(\d+)/); return m ? Number(m[1]) * 60 + Number(m[2]) : undefined; })()
-            };
-          }).filter(Boolean);
-        const header = data?.header?.musicDetailHeaderRenderer || data?.header?.musicImmersiveHeaderRenderer;
+        // Album pages come in two layouts: two-column (current) and single-column
+        const two = data?.contents?.twoColumnBrowseResultsRenderer;
+        const single = data?.contents?.singleColumnBrowseResultsRenderer;
+        const headerSection = (two?.tabs?.[0] || single?.tabs?.[0])?.tabRenderer?.content?.sectionListRenderer?.contents?.[0] || {};
+        const shelfSources = [
+          two?.secondaryContents?.sectionListRenderer?.contents || [],
+          single?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents || [],
+          data?.contents?.sectionListRenderer?.contents || []
+        ];
+        const header = headerSection.musicResponsiveHeaderRenderer || headerSection.musicDetailHeaderRenderer || data?.header?.musicDetailHeaderRenderer || data?.header?.musicImmersiveHeaderRenderer;
+        const trackLists = [];
+        for (const source of shelfSources) {
+          for (const section of source) {
+            const items = section.musicShelfRenderer?.contents;
+            if (items?.length) trackLists.push(items);
+          }
+        }
+        const tracks = trackLists.flat().map(item => {
+          const videoId = ytVideoId(item.musicResponsiveListItemRenderer || item);
+          if (!videoId) return null;
+          const columns = item.musicResponsiveListItemRenderer?.flexColumns || [];
+          const runs = columns[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
+          const sub = columns[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
+          return {
+            id: 'synthetiq_music_gateway:yt:' + videoId,
+            href: 'synthetiq_music_gateway:yt:' + videoId,
+            type: 'track',
+            title: ytText(runs[0]?.text) || 'Track',
+            artist: ytText(sub[0]?.text) || 'Unknown Artist',
+            album: ytText(header?.title?.runs) || undefined,
+            durationSeconds: (() => { const m = ytText(sub[sub.length - 1]?.text).match(/(\d+):(\d+)/); return m ? Number(m[1]) * 60 + Number(m[2]) : undefined; })()
+          };
+        }).filter(Boolean);
         if (tracks.length) {
+          const subtitleRuns = header?.subtitle?.runs?.map(run => run.text) || [];
           const album = {
             id: cleanId,
             title: ytText(header?.title?.runs) || 'Album',
-            artist: ytText(header?.subtitle?.runs?.[0]?.text) || 'Various Artists',
+            artist: ytText(header?.straplineTextOne?.runs) || ytText(subtitleRuns[0]) || 'Various Artists',
             image: Array.isArray(header?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails) ? header.thumbnail.musicThumbnailRenderer.thumbnail.thumbnails.slice(-1)[0]?.url : undefined,
-            year: ytText(header?.subtitle?.runs?.map(run => run.text).find(t => /^\d{4}/.test(t || ''))) || undefined,
+            year: ytText(subtitleRuns.find(t => /^\d{4}/.test(t || ''))) || undefined,
             tracks
           };
           return ok(ytRemember(cacheKey, album));
@@ -643,37 +684,36 @@
   async function homeSections(page) {
     if (Number(page) > 0) return ok([]);
     const sections = [];
-    // 1. YouTube Music charts (real trending, refreshed by YouTube)
+    // 1. YouTube Music charts (real trending, refreshed by YouTube) — fetched in parallel
     try {
       const cachedSections = ytCached('home', 900000);
       if (cachedSections) return ok(cachedSections);
-      const charts = [
-        { title: 'Trending Worldwide', params: 'Ege4w7uDmZoHAxIQk7LNpI0RUq5cUNhSYQ%3D%3D' },
-        { title: 'Top Music Videos', params: 'Ege4w7uDmZoHAxIQk7LNpI0RUq5cUNhSYQ%3D%3D' }
-      ];
-      for (const chart of charts) {
-        try {
-          const data = await ytPost('/search', { query: '', params: chart.params });
-          const items = (data?.contents?.tabbedSearchResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents || [])
-            .flatMap(section => section.musicShelfRenderer?.contents || [])
-            .map(ytToTrack).filter(Boolean);
-          if (items.length) sections.push({ title: chart.title, type: 'track', items: items.slice(0, 24) });
-        } catch (_) {}
-      }
+      const chartJobs = await Promise.allSettled([
+        ytPost('/search', { query: 'trending music hits', params: 'Ege4w7uDmZoHAxIQk7LNpI0RUq5cUNhSYQ%3D%3D' }).catch(() => null),
+        ytPost('/search', { query: 'top music videos', params: 'Ege4w7uDmZoHAxIQk7LNpI0RUq5cUNhSYQ%3D%3D' }).catch(() => null)
+      ]);
+      const titles = ['Trending Worldwide', 'Top Music Videos'];
+      chartJobs.forEach((job, index) => {
+        if (job.status !== 'fulfilled' || !job.value) return;
+        const items = (job.value?.contents?.tabbedSearchResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents || [])
+          .flatMap(section => section.musicShelfRenderer?.contents || [])
+          .map(item => ytToTrack(item.musicResponsiveListItemRenderer || item)).filter(Boolean);
+        if (items.length) sections.push({ title: titles[index], type: 'track', items: items.slice(0, 24) });
+      });
     } catch (_) {}
-    // 2. Search-based fallback sections
-    const queries = [
-      { title: 'Top Hits & Trending', query: 'top hits' },
-      { title: 'New Releases', query: 'latest songs' },
-      { title: 'Popular Worldwide', query: 'global hits' }
-    ];
-    for (const row of queries) {
-      if (sections.length >= 3) break;
-      const result = await searchResults(row.query, 0);
-      if (result.ok) {
+    // 2. Search-based fallback sections — also parallel
+    if (sections.length < 3) {
+      const queries = [
+        { title: 'Top Hits & Trending', query: 'top hits' },
+        { title: 'New Releases', query: 'latest songs' },
+        { title: 'Popular Worldwide', query: 'global hits' }
+      ];
+      const results = await Promise.all(queries.map(row => searchResults(row.query, 0).catch(() => null)));
+      results.forEach((result, index) => {
+        if (!result || !result.ok || sections.length >= 3) return;
         const items = JSON.parse(result.data);
-        if (items.length) sections.push({ title: row.title, type: 'track', items: items.slice(0, 12) });
-      }
+        if (items.length) sections.push({ title: queries[index].title, type: 'track', items: items.slice(0, 12) });
+      });
     }
     return sections.length ? ok(sections) : fail('Music discovery is temporarily unavailable.');
   }
@@ -756,11 +796,21 @@
     }
     let query = seed.startsWith('catalogue:') ? parseTrackQuery(seed) : null;
     if (!query && ytVideo) {
-      // Resolve the track title/artist from YouTube, then query LRCLIB with it
+      // Resolve the track title from the /next endpoint (works without login)
       try {
-        const results = await ytSearch(seed.startsWith('catalogue:') ? parseTrackQuery(seed) : ytVideo);
-        if (results.length) query = (results[0].title.replace(/\((official|lyric|audio|video).*$/i, '').trim() + ' ' + results[0].artist).trim();
+        const next = await ytPost('/next', { videoId: ytVideo });
+        const panel = next?.contents?.singleColumnMusicWatchNextResultsRenderer?.tabbedRenderer?.watchNextTabbedResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.musicQueueRenderer?.content?.playlistPanelRenderer;
+        const current = (panel?.contents || []).find(entry => (entry.playlistPanelVideoRenderer?.title?.runs?.[0]?.text || '').length > 0)
+          || panel?.contents?.[0];
+        const title = ytText(current?.playlistPanelVideoRenderer?.title?.runs);
+        if (title) query = title.replace(/\((official|lyric|audio|video)[^)]*\)/i, '').trim();
       } catch (_) {}
+      if (!query) {
+        try {
+          const results = await ytSearch(ytVideo);
+          if (results.length) query = (results[0].title.replace(/\((official|lyric|audio|video).*$/i, '').trim() + ' ' + results[0].artist).trim();
+        } catch (_) {}
+      }
     }
     if (!query) query = seed.split(':').pop();
     if (query && query.length > 1) {
@@ -784,8 +834,8 @@
 
   // --- Artist pages: top tracks, albums, singles, related artists ---
   async function getArtist(artistId) {
-    const clean = String(artistId || '').trim().replace(/^(synthetiq_music_gateway|freefy):/, '');
-    if (!clean || clean.indexOf(':') !== -1 && !clean.startsWith('UC')) return fail('Artist ID required.');
+    const clean = String(artistId || '').trim().replace(/^(synthetiq_music_gateway|freefy):(artist:)?/, '');
+    if (!clean || !clean.startsWith('UC') && clean.indexOf(':') !== -1) return fail('Artist ID required.');
     const cacheKey = 'artist:' + clean;
     const cachedArtist = ytCached(cacheKey, 3600000);
     if (cachedArtist) return ok(cachedArtist);
@@ -832,7 +882,7 @@
 
   // --- Playlists: browse YouTube Music playlists (VL/PL browse IDs) ---
   async function getPlaylist(playlistId) {
-    let browseId = String(playlistId || '').trim().replace(/^(synthetiq_music_gateway|freefy):/, '');
+    let browseId = String(playlistId || '').trim().replace(/^(synthetiq_music_gateway|freefy):(playlist:)?/, '');
     if (!browseId) return fail('Playlist ID required.');
     if (/^(VL|PL|RD|OL|UU)/.test(browseId) && !browseId.startsWith('VL')) browseId = 'VL' + browseId;
     const cacheKey = 'playlist:' + browseId;
