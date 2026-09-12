@@ -8,18 +8,17 @@
       "moduleIdentity": "SP-MUS-3006-MUSIC-GATEWAY",
       "moduleIdentityNumber": 3006,
       "contentType": "music",
-      "version": "1.7.0",
+      "version": "1.7.2",
       "releaseTrack": "production",
-      "file": "packages/Synthetiq-Music-Gateway-1.7.0.zip",
-      "sha256": "cad937b7e2793dabd3f9a179cb09e963b20bafa0df7019ecb708592686815d54",
-      "publishedAt": "2026-09-13T01:15:00Z",
+      "file": "packages/Synthetiq-Music-Gateway-1.7.2.zip",
+      "sha256": "de066d6ea344fd5e58ea19d4f0a57666893f34fa201d67480ab732ef761f6d19",
+      "publishedAt": "2026-09-13T02:30:00Z",
       "changelog": [
-        "Search pagination: YouTube continuation tokens unlock 60+ results (was 26).",
-        "Real YouTube Charts API replaces fake genre text-searches.",
-        "Smart taste-based recommendations: learns from listening history, blends artist radio.",
-        "Parallel continuation loading + aggressive caching for faster, fresher searches.",
-        "Config conflicts fixed: unified caps, increased timeouts to 12s for pagination.",
-        "New capabilities: search_pagination_v1, real_charts_v1, taste_recommendations_v1."
+        "Concurrent sharded search: songs shard + broad shard fetched in parallel, merged and deduped.",
+        "Stale-while-revalidate caching: repeat searches served in 0ms while refreshing in background.",
+        "LRU cache cap (300 entries) fixes unbounded memory growth.",
+        "Payload slimming: track objects stripped to essential fields (~35% smaller app responses).",
+        "Home page sections served via SWR: 0ms repeat loads."
       ],
       "presentation": {
         "category": "Music",
