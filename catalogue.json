@@ -1,1 +1,127 @@
-{"schemaVersion": 1, "repository": "Synthetic Music Connectors", "modules": [{"moduleId": "synthetiq-music-gateway-v1", "moduleFamilyId": "synthetiq_music_gateway", "moduleIdentity": "SP-MUS-3006-MUSIC-GATEWAY", "moduleIdentityNumber": 3006, "contentType": "music", "version": "1.9.0", "releaseTrack": "production", "file": "packages/Synthetiq-Music-Gateway-1.9.0.zip", "sha256": "23823ab7261dffab0ecd71c55ce9902d48095745fa8f65af78b8bd51e54ca786", "publishedAt": "2026-09-13T07:30:00Z", "changelog": ["Performance overhaul: 7 critical bugs fixed for 60-87% latency improvement.", "Fix: Search pages now parallelized (700ms → 350ms). Pages 2-3 fetch in parallel with page 1 parsing.", "Fix: Stale-while-revalidate cache fully corrected. Cached results return instantly, refresh happens in background (200ms → 5ms).", "Fix: Mirror health now expires after 1 hour (was permanent blacklist). Transient failures no longer block fallback forever.", "Fix: tasteSave() called once per play instead of twice. 50% reduction in storage I/O.", "Fix: Radio seed track filtering corrected using normalized track IDs. No more duplicate recommendations.", "Fix: Cache memory now bounded at 10MB with smart eviction by size. Memory leaks eliminated.", "Fix: Fallback audio search now tries top 3 candidates in parallel instead of sequentially (60-70% faster).", "Perf: Overall track load time reduced from 1000-1300ms to 500-600ms.", "Perf: Home page now streams sections progressively (1200ms → 300ms).", "Quality: Radio recommendations improved by fixing seed track deduplication.", "Stability: Mirror system now recovers from transient failures.", "Stability: Long sessions no longer experience memory-related slowdowns."]}, {"moduleId": "synthetiq-music-gateway-v1", "moduleFamilyId": "synthetiq_music_gateway", "moduleIdentity": "SP-MUS-3006-MUSIC-GATEWAY", "moduleIdentityNumber": 3006, "contentType": "music", "version": "1.8.3", "releaseTrack": "staging", "file": "packages/Synthetiq-Music-Gateway-1.8.3.zip", "sha256": "72c1fd238eea2074f797da1a922669e56436da7d3398cfe1ff8763790131c9c2", "publishedAt": "2026-09-13T06:10:00Z", "changelog": ["Fix: expanded-catalog search phasing was silently degraded live — continuation tokens live inside musicShelfRenderer.continuations on real responses (not the section list), so pages 2-3 never fired and each search returned ~45 tracks instead of the full phased set.", "Continuation pages now parsed from continuationContents.musicShelfContinuation (live response shape for pages 2+).", "Measured live: 85 tracks per search across 4 phased requests (2 parallel shards + 2 chained continuations), up from ~45."]}, {"moduleId": "synthetiq-music-gateway-v1", "moduleFamilyId": "synthetiq_music_gateway", "moduleIdentity": "SP-MUS-3006-MUSIC-GATEWAY", "moduleIdentityNumber": 3006, "contentType": "music", "version": "1.8.2", "releaseTrack": "staging", "file": "packages/Synthetiq-Music-Gateway-1.8.2.zip", "sha256": "eb280e8615209c33c1f580d1ef7d935e769f975def9c3de41cdd34cc06367c81", "publishedAt": "2026-09-13T05:20:00Z", "changelog": ["Fix: charts rewired to the live FEmusic_charts page — the legacy per-type browseIds now return HTTP 400 from YouTube Music.", "Songs charts now resolve the strongest chart playlist (Trending 20 / Daily Top / Top 50) and serve its real track list.", "Fix: Trending Worldwide shelf used expired search params and only read one shelf type — now uses the songs filter and reads all live section shapes (24 items instead of 0).", "No contract changes: same exports, envelopes, and id formats as 1.8.x."]}, {"moduleId": "synthetiq-music-gateway-v1", "moduleFamilyId": "synthetiq_music_gateway", "moduleIdentity": "SP-MUS-3006-MUSIC-GATEWAY", "moduleIdentityNumber": 3006, "contentType": "music", "version": "1.8.1", "releaseTrack": "staging", "file": "packages/Synthetiq-Music-Gateway-1.8.1.zip", "sha256": "4a6a27ec0550483df0431edbc0bf2e7e5b4f8771fda5c4c1d4c7b718732a68ca", "publishedAt": "2026-09-13T04:30:00Z", "changelog": ["Fix: duplicate extractTracks declaration silently replaced the search response parser, breaking YouTube search pagination and results.", "Fix: charts shelf parsing had an operator-precedence bug and skipped carousel shelves (real YouTube Music charts use carousels); two-row items now parse with correct title/artist.", "Fix: charts no longer cache an empty result for an hour on transient failure.", "Fix: audio fallback search recursion is depth-capped (max 2) to prevent unbounded recursion.", "Fix: radio results now correctly filter out the seed track (qualified-id comparison).", "Fix: artist guard now validates real channel IDs (UC/MPUC) instead of a broken precedence check.", "Perf: taste profile persisted once per play signal instead of twice."]}, {"moduleId": "synthetiq-music-gateway-v1", "moduleFamilyId": "synthetiq_music_gateway", "moduleIdentity": "SP-MUS-3006-MUSIC-GATEWAY", "moduleIdentityNumber": 3006, "contentType": "music", "version": "1.8.0", "releaseTrack": "staging", "file": "packages/Synthetiq-Music-Gateway-1.8.0.zip", "sha256": "908e5bb5457b062731ee2f39c25de391a282d169ea4437869b248cf8b42dac7f", "publishedAt": "2026-09-13T03:10:00Z", "changelog": ["Self-learning taste engine: implicit play signals from every stream and radio start — works with zero app changes.", "Persistent-lite profiles: taste survives sessions when storage is available, degrades gracefully to session memory.", "New Releases From Your Artists: monthly-filtered radar shelf on the home page.", "Trending In Your Taste: charts intersected with your artist affinity.", "Search re-ranking by artist affinity; already-played tracks demoted.", "Response budget guard: home payload kept under the app's 512KB cap.", "manifest.json now included in package (contract hygiene with upstream)."]}]}
+{
+  "schemaVersion": 1,
+  "repository": "Synthetic Music Connectors",
+  "modules": [
+    {
+      "moduleId": "synthetiq-music-gateway-v1",
+      "moduleFamilyId": "synthetiq_music_gateway",
+      "moduleIdentity": "SP-MUS-3006-MUSIC-GATEWAY",
+      "moduleIdentityNumber": 3006,
+      "contentType": "music",
+      "version": "1.9.1",
+      "releaseTrack": "production",
+      "file": "packages/Synthetiq-Music-Gateway-1.9.1.zip",
+      "sha256": "791a40878f0c9fa243147b8de8fd28a4000879975a0dcb1dc748a6574a4823ef",
+      "publishedAt": "2026-09-13T08:30:00Z",
+      "changelog": [
+        "Fix: Package layout corrected \u2014 files restored under modules/synthetiq_music_gateway/ so the host can locate runtime entry index.js (module was not recognized).",
+        "Fix: manifest moduleVersion now matches package version 1.9.1.",
+        "All 1.9.0 performance and stability fixes included unchanged."
+      ]
+    },
+    {
+      "moduleId": "synthetiq-music-gateway-v1",
+      "moduleFamilyId": "synthetiq_music_gateway",
+      "moduleIdentity": "SP-MUS-3006-MUSIC-GATEWAY",
+      "moduleIdentityNumber": 3006,
+      "contentType": "music",
+      "version": "1.9.0",
+      "releaseTrack": "production",
+      "file": "packages/Synthetiq-Music-Gateway-1.9.0.zip",
+      "sha256": "23823ab7261dffab0ecd71c55ce9902d48095745fa8f65af78b8bd51e54ca786",
+      "publishedAt": "2026-09-13T07:30:00Z",
+      "changelog": [
+        "Performance overhaul: 7 critical bugs fixed for 60-87% latency improvement.",
+        "Fix: Search pages now parallelized (700ms \u2192 350ms). Pages 2-3 fetch in parallel with page 1 parsing.",
+        "Fix: Stale-while-revalidate cache fully corrected. Cached results return instantly, refresh happens in background (200ms \u2192 5ms).",
+        "Fix: Mirror health now expires after 1 hour (was permanent blacklist). Transient failures no longer block fallback forever.",
+        "Fix: tasteSave() called once per play instead of twice. 50% reduction in storage I/O.",
+        "Fix: Radio seed track filtering corrected using normalized track IDs. No more duplicate recommendations.",
+        "Fix: Cache memory now bounded at 10MB with smart eviction by size. Memory leaks eliminated.",
+        "Fix: Fallback audio search now tries top 3 candidates in parallel instead of sequentially (60-70% faster).",
+        "Perf: Overall track load time reduced from 1000-1300ms to 500-600ms.",
+        "Perf: Home page now streams sections progressively (1200ms \u2192 300ms).",
+        "Quality: Radio recommendations improved by fixing seed track deduplication.",
+        "Stability: Mirror system now recovers from transient failures.",
+        "Stability: Long sessions no longer experience memory-related slowdowns."
+      ]
+    },
+    {
+      "moduleId": "synthetiq-music-gateway-v1",
+      "moduleFamilyId": "synthetiq_music_gateway",
+      "moduleIdentity": "SP-MUS-3006-MUSIC-GATEWAY",
+      "moduleIdentityNumber": 3006,
+      "contentType": "music",
+      "version": "1.8.3",
+      "releaseTrack": "staging",
+      "file": "packages/Synthetiq-Music-Gateway-1.8.3.zip",
+      "sha256": "72c1fd238eea2074f797da1a922669e56436da7d3398cfe1ff8763790131c9c2",
+      "publishedAt": "2026-09-13T06:10:00Z",
+      "changelog": [
+        "Fix: expanded-catalog search phasing was silently degraded live \u2014 continuation tokens live inside musicShelfRenderer.continuations on real responses (not the section list), so pages 2-3 never fired and each search returned ~45 tracks instead of the full phased set.",
+        "Continuation pages now parsed from continuationContents.musicShelfContinuation (live response shape for pages 2+).",
+        "Measured live: 85 tracks per search across 4 phased requests (2 parallel shards + 2 chained continuations), up from ~45."
+      ]
+    },
+    {
+      "moduleId": "synthetiq-music-gateway-v1",
+      "moduleFamilyId": "synthetiq_music_gateway",
+      "moduleIdentity": "SP-MUS-3006-MUSIC-GATEWAY",
+      "moduleIdentityNumber": 3006,
+      "contentType": "music",
+      "version": "1.8.2",
+      "releaseTrack": "staging",
+      "file": "packages/Synthetiq-Music-Gateway-1.8.2.zip",
+      "sha256": "eb280e8615209c33c1f580d1ef7d935e769f975def9c3de41cdd34cc06367c81",
+      "publishedAt": "2026-09-13T05:20:00Z",
+      "changelog": [
+        "Fix: charts rewired to the live FEmusic_charts page \u2014 the legacy per-type browseIds now return HTTP 400 from YouTube Music.",
+        "Songs charts now resolve the strongest chart playlist (Trending 20 / Daily Top / Top 50) and serve its real track list.",
+        "Fix: Trending Worldwide shelf used expired search params and only read one shelf type \u2014 now uses the songs filter and reads all live section shapes (24 items instead of 0).",
+        "No contract changes: same exports, envelopes, and id formats as 1.8.x."
+      ]
+    },
+    {
+      "moduleId": "synthetiq-music-gateway-v1",
+      "moduleFamilyId": "synthetiq_music_gateway",
+      "moduleIdentity": "SP-MUS-3006-MUSIC-GATEWAY",
+      "moduleIdentityNumber": 3006,
+      "contentType": "music",
+      "version": "1.8.1",
+      "releaseTrack": "staging",
+      "file": "packages/Synthetiq-Music-Gateway-1.8.1.zip",
+      "sha256": "4a6a27ec0550483df0431edbc0bf2e7e5b4f8771fda5c4c1d4c7b718732a68ca",
+      "publishedAt": "2026-09-13T04:30:00Z",
+      "changelog": [
+        "Fix: duplicate extractTracks declaration silently replaced the search response parser, breaking YouTube search pagination and results.",
+        "Fix: charts shelf parsing had an operator-precedence bug and skipped carousel shelves (real YouTube Music charts use carousels); two-row items now parse with correct title/artist.",
+        "Fix: charts no longer cache an empty result for an hour on transient failure.",
+        "Fix: audio fallback search recursion is depth-capped (max 2) to prevent unbounded recursion.",
+        "Fix: radio results now correctly filter out the seed track (qualified-id comparison).",
+        "Fix: artist guard now validates real channel IDs (UC/MPUC) instead of a broken precedence check.",
+        "Perf: taste profile persisted once per play signal instead of twice."
+      ]
+    },
+    {
+      "moduleId": "synthetiq-music-gateway-v1",
+      "moduleFamilyId": "synthetiq_music_gateway",
+      "moduleIdentity": "SP-MUS-3006-MUSIC-GATEWAY",
+      "moduleIdentityNumber": 3006,
+      "contentType": "music",
+      "version": "1.8.0",
+      "releaseTrack": "staging",
+      "file": "packages/Synthetiq-Music-Gateway-1.8.0.zip",
+      "sha256": "908e5bb5457b062731ee2f39c25de391a282d169ea4437869b248cf8b42dac7f",
+      "publishedAt": "2026-09-13T03:10:00Z",
+      "changelog": [
+        "Self-learning taste engine: implicit play signals from every stream and radio start \u2014 works with zero app changes.",
+        "Persistent-lite profiles: taste survives sessions when storage is available, degrades gracefully to session memory.",
+        "New Releases From Your Artists: monthly-filtered radar shelf on the home page.",
+        "Trending In Your Taste: charts intersected with your artist affinity.",
+        "Search re-ranking by artist affinity; already-played tracks demoted.",
+        "Response budget guard: home payload kept under the app's 512KB cap.",
+        "manifest.json now included in package (contract hygiene with upstream)."
+      ]
+    }
+  ]
+}
