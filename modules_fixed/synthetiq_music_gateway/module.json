@@ -1,12 +1,12 @@
 {
   "id": "synthetiq-music-gateway-v1",
   "name": "Synthetiq Music Gateway",
-  "description": "Unified music search and playback: YouTube Music catalog with parallel sharded search, true paginated continuation expansion, per-shelf home caching, self-learning taste engine with genre-radius radio, new-release radar, real charts, resilient streaming, radio, albums, lyrics, and artist pages.",
+  "description": "Unified music search and playback with low-latency progressive search, predictive audio prefetch, cache-first home shelves, resilient streaming, radio, albums, lyrics, artists, playlists, charts, and taste recommendations.",
   "type": "client",
   "contentType": "music",
   "contractVersion": 4,
   "formatVersion": 3,
-  "moduleVersion": "1.9.2",
+  "moduleVersion": "1.10.0",
   "moduleFamilyId": "synthetiq_music_gateway",
   "moduleIdentity": "SP-MUS-3006-MUSIC-GATEWAY",
   "moduleIdentityNumber": 3006,
@@ -30,12 +30,12 @@
     },
     "runtime": {
       "mode": "local",
-      "entry": "index.js"
+      "entry": "fast.js"
     },
     "caps": {
       "homeMaxResults": 48,
       "maxResponseBytes": 524288,
-      "timeoutMs": 12000,
+      "timeoutMs": 3500,
       "maxConcurrentRequests": 6,
       "searchPaginationPages": 3,
       "cacheStrategy": "stale-while-revalidate-lru"
