@@ -10,15 +10,55 @@
 
   const YT_API = 'https://music.youtube.com/youtubei/v1';
   const YT_CACHE = new Map();
+  const CACHE_MAX = 300;
   const YT_CONTEXT = { client: { clientName: 'WEB_REMIX', clientVersion: '1.20240101.01.00', hl: 'en', gl: 'US' } };
-  const ytCached = (key, ttl) => { const item = YT_CACHE.get(key); return item && Date.now() - item.time < ttl ? item.value : null; };
-  const ytRemember = (key, value) => { YT_CACHE.set(key, { time: Date.now(), value }); return value; };
+
+  // LRU-capped cache: touch on read, evict oldest on insert
+  function cacheSet(key, value) {
+    YT_CACHE.delete(key);
+    YT_CACHE.set(key, { time: Date.now(), value });
+    while (YT_CACHE.size > CACHE_MAX) YT_CACHE.delete(YT_CACHE.keys().next().value);
+  }
+  const ytRemember = (key, value) => { cacheSet(key, value); return value; };
+  const ytCached = (key, ttl) => {
+    const item = YT_CACHE.get(key);
+    if (!item) return null;
+    if (Date.now() - item.time < ttl) { YT_CACHE.delete(key); YT_CACHE.set(key, item); return item.value; }
+    return null;
+  };
+  const ytStale = (key) => YT_CACHE.get(key)?.value ?? null;
+  const ytRefreshing = new Set();
+  // Stale-while-revalidate: serve stale instantly, refresh once in background
+  async function swr(key, ttl, refresh) {
+    const fresh = ytCached(key, ttl);
+    if (fresh) return fresh;
+    if (ytRefreshing.has(key)) return ytStale(key);
+    ytRefreshing.add(key);
+    try {
+      const value = await refresh();
+      if (value) ytRemember(key, value);
+      return value ?? ytStale(key);
+    } catch (_) {
+      return ytStale(key);
+    } finally {
+      ytRefreshing.delete(key);
+    }
+  }
+  const slimTrack = t => {
+    if (!t) return t;
+    const out = { id: t.id, type: t.type, title: t.title, artist: t.artist };
+    if (t.album) out.album = t.album;
+    if (t.image) out.image = t.image;
+    if (t.durationSeconds) out.durationSeconds = t.durationSeconds;
+    return out;
+  };
+  
   async function ytPost(path, body) {
     const doFetch = async () => {
       const res = await fetch(YT_API + path + '?alt=json', {
         method: 'POST',
         signal: AbortSignal.timeout(8000),
-        headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36' },
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': 'Mozilla/5.0' },
         body: JSON.stringify({ context: YT_CONTEXT, ...body })
       });
       if (!res.ok) throw new Error('YT HTTP ' + res.status);
@@ -26,15 +66,20 @@
     };
     try { return await doFetch(); } catch (_) { return doFetch(); }
   }
+  
   function ytText(value) { return Array.isArray(value) ? value.map(item => item.text || '').join('') : String(value || ''); }
+  
   function ytVideoId(item) {
-    return item?.videoId || item?.playlistItemData?.videoId || item?.doubleTapCommand?.watchEndpoint?.videoId || item?.overlay?.musicItemThumbnailOverlayRenderer?.content?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint?.videoId;
+    return item?.videoId || item?.playlistItemData?.videoId || item?.doubleTapCommand?.watchEndpoint?.videoId || item?.navigationEndpoint?.watchEndpoint?.videoId || item?.overlay?.musicItemThumbnailOverlayRenderer?.content?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint?.videoId;
   }
+  
   function ytToTrack(item) {
     if (!item) return null;
-    // Card shelf (top result) has a different shape than list items
     if (item.messageRenderer || item.musicResponsiveHeaderRenderer) return null;
     const isCard = !!item.musicCardShelfRenderer;
+    let isTwoRow = false;
+    if (item.musicTwoRowItemRenderer) { item = item.musicTwoRowItemRenderer; isTwoRow = true; }
+    else if ((item.title?.runs || item.subtitle?.runs) && item.navigationEndpoint && !item.flexColumns && !item.videoId) isTwoRow = true;
     const card = isCard ? item.musicCardShelfRenderer : null;
     const source = card || item;
     let videoId = ytVideoId(source);
@@ -42,7 +87,6 @@
       videoId = card.title?.runs?.[0]?.navigationEndpoint?.watchEndpoint?.videoId
         || card.buttons?.find(button => button.buttonRenderer?.navigationEndpoint?.watchEndpoint?.videoId)?.buttonRenderer?.navigationEndpoint?.watchEndpoint?.videoId;
     }
-    // Albums / artists / playlists come back as browse collections, not video IDs
     const browseId = source.navigationEndpoint?.browseEndpoint?.browseId
       || source.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs?.[0]?.navigationEndpoint?.browseEndpoint?.browseId
       || card?.title?.runs?.[0]?.navigationEndpoint?.browseEndpoint?.browseId;
@@ -50,10 +94,10 @@
     const isCollection = !videoId && browseId;
     const columns = source.flexColumns || [];
     const runs = columns[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs
-      || (isCard ? card.title?.runs : []);
+      || (isCard ? card.title?.runs : isTwoRow ? item.title?.runs : []);
     const sub = columns[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs
-      || (isCard ? card.subtitle?.runs : []);
-    const thumbs = source.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || card?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails;
+      || (isCard ? card.subtitle?.runs : isTwoRow ? item.subtitle?.runs : []);
+    const thumbs = source.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || card?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || (isTwoRow ? item.thumbnailRenderer?.musicThumbnailRenderer?.thumbnail?.thumbnails : undefined);
     const durationMatch = ytText(sub[sub.length - 1]?.text).match(/(\d+):(\d+)/);
     const rawId = videoId || browseId;
     const kind = isCollection
@@ -70,8 +114,8 @@
       durationSeconds: durationMatch ? Number(durationMatch[1]) * 60 + Number(durationMatch[2]) : Number(source.lengthSeconds) || undefined
     };
   }
-  async function ytSearch(term, params) {
-    const data = await ytPost('/search', { query: term, params });
+
+  function extractSearchTracks(data) {
     const sections = data?.contents?.tabbedSearchResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents || [];
     const tracks = [];
     for (const section of sections) {
@@ -90,8 +134,71 @@
         }
       }
     }
-    return tracks;
+    return { tracks, continuation: data?.contents?.tabbedSearchResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.continuations?.[0]?.nextContinuationData?.continuation };
   }
+
+  async function ytSearchPipelined(term, params, pageCount = 3) {
+    const allTracks = [];
+    const dedup = new Set();
+    
+    let page1Promise = ytPost('/search', { query: term, params });
+    let page1Data = await page1Promise;
+    const { tracks: tracks1, continuation: cont1 } = extractSearchTracks(page1Data);
+    for (const t of tracks1) {
+      if (!dedup.has(t.id)) {
+        allTracks.push(t);
+        dedup.add(t.id);
+      }
+    }
+    
+    if (pageCount <= 1 || !cont1) return allTracks;
+    
+    let page2Promise = ytPost('/search', { continuation: cont1 });
+    let page2Data = await page2Promise;
+    const { tracks: tracks2, continuation: cont2 } = extractSearchTracks(page2Data);
+    for (const t of tracks2) {
+      if (!dedup.has(t.id)) {
+        allTracks.push(t);
+        dedup.add(t.id);
+      }
+    }
+    
+    if (pageCount <= 2 || !cont2) return allTracks;
+    
+    let page3Data = await ytPost('/search', { continuation: cont2 });
+    const { tracks: tracks3 } = extractSearchTracks(page3Data);
+    for (const t of tracks3) {
+      if (!dedup.has(t.id)) {
+        allTracks.push(t);
+        dedup.add(t.id);
+      }
+    }
+    
+    return allTracks;
+  }
+
+  // Sharded search: songs-filter shard + broad shard race in parallel, merged & deduped.
+  // Continuation chains are inherently sequential, but two independent queries are not.
+  async function ytSearchSharded(term, params, pageCount = 3) {
+    const songsParams = params || SEARCH_FILTERS.type.songs;
+    const [primary, broad] = await Promise.allSettled([
+      ytSearchPipelined(term, songsParams, pageCount),
+      pageCount > 1 ? ytSearchPipelined(term, undefined, 1) : Promise.resolve([])
+    ]);
+    const allTracks = [];
+    const dedup = new Set();
+    for (const result of [primary, broad]) {
+      if (result.status !== 'fulfilled') continue;
+      for (const t of result.value) {
+        if (!dedup.has(t.id)) {
+          allTracks.push(slimTrack(t));
+          dedup.add(t.id);
+        }
+      }
+    }
+    return allTracks;
+  }
+
   async function ytAudio(videoId, quality) {
     const data = await ytPost('/player', { videoId, contentCheckOk: true, racyCheckOk: true });
     const formats = (data?.streamingData?.adaptiveFormats || []).filter(f => f.url && (!f.mimeType || f.mimeType.startsWith('audio/')));
@@ -111,13 +218,13 @@
       quality: String(Math.round(Number(best.bitrate || 0) / 1000)) + 'kbps'
     };
   }
+  
   async function ytRadio(seedVideoId) {
     const data = await ytPost('/next', { videoId: seedVideoId, playlistId: 'RDAMVM' + seedVideoId });
     const panel = data?.contents?.singleColumnMusicWatchNextResultsRenderer?.tabbedRenderer?.watchNextTabbedResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.musicQueueRenderer?.content?.playlistPanelRenderer;
     return (panel?.contents || []).map(entry => ytToTrack(entry.playlistPanelVideoRenderer || entry)).filter(Boolean);
   }
 
-  // --- Resilient mirror pools (health-checked, latency-routed) ---
   const MIRROR_POOLS = {
     invidious: ['https://iv.datura.network/api/v1', 'https://invidious.nerdvpn.de/api/v1', 'https://iv.melmac.space/api/v1', 'https://invidious.privacyredirect.com/api/v1', 'https://inv.tux.pizza/api/v1', 'https://invidious.f5.si/api/v1', 'https://invidious.materialio.us/api/v1'],
     piped: ['https://pipedapi.moomoo.me', 'https://pipedapi.adminforge.de', 'https://api.piped.yt', 'https://pipedapi.drgns.space', 'https://pipedapi.reallyaweso.me']
@@ -131,7 +238,7 @@
   async function mirrorGetJson(url) {
     const started = Date.now();
     try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(5000), headers: { Accept: 'application/json', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36' } });
+      const res = await fetch(url, { signal: AbortSignal.timeout(5000), headers: { Accept: 'application/json', 'User-Agent': 'Mozilla/5.0' } });
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
       mirrorMark(url, Date.now() - started, true);
@@ -141,7 +248,6 @@
       throw error;
     }
   }
-  // Race the healthiest mirrors in parallel; first success wins (Promise.any)
   async function raceMirrors(pool, makeUrl) {
     const candidates = mirrors(pool).slice(0, 3);
     if (!candidates.length) throw new Error('no healthy mirrors');
@@ -159,7 +265,6 @@
     return sorted[0];
   };
 
-  // --- Search filter / type params (YouTube encoded filter tokens) ---
   const SEARCH_FILTERS = {
     type: { songs: 'EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D', videos: 'EgWKAQIQAWoKEAkQChAFEAMQBA%3D%3D', albums: 'EgWKAQIYAWoKEAkQChAFEAMQBA%3D%3D', artists: 'EgWKAQIgAWoKEAkQChAFEAMQBA%3D%3D', playlists: 'EgeKAQQoAEABagoQAxoEEAMQBQ%3D%3D', podcasts: 'EgeKAQQoADgBagwQAiABCAVSAA%3D%3D', featured_playlists: 'EgeKAQQoAEABagoQAxoEEAMQBQ%3D%3D' },
     uploadDate: { lastHour: 'EgIIAQ%3D%3D', today: 'EgIIAg%3D%3D', thisWeek: 'EgIIAw%3D%3D', thisMonth: 'EgIIBA%3D%3D', thisYear: 'EgIIBQ%3D%3D' },
@@ -179,37 +284,166 @@
     return parts.length ? parts[0] : undefined;
   }
 
-  // --- Genre / mood charts (curated YouTube Music searches, cached) ---
-  const GENRE_QUERIES = {
-    pop: 'top pop hits',
-    hiphop: 'top hip hop hits',
-    dance: 'top dance hits',
-    rock: 'top rock hits',
-    lofi: 'lofi chill beats',
-    jazz: 'top jazz classics',
-    classical: 'classical essentials',
-    latin: 'top latin hits',
-    kpop: 'top k-pop hits',
-    afrobeats: 'top afrobeats hits',
-    rnb: 'top r&b hits',
-    workout: 'workout motivation music',
-    chill: 'chill relaxing music',
-    country: 'top country hits',
-    metal: 'top metal hits',
-    indie: 'indie essentials'
-  };
-  async function getGenreCharts(genre) {
-    const key = String(genre || 'pop').toLowerCase();
-    const query = GENRE_QUERIES[key];
-    if (!query) return fail('Unknown genre. Try: ' + Object.keys(GENRE_QUERIES).join(', '));
-    const cacheKey = 'charts:' + key;
-    const cachedCharts = ytCached(cacheKey, 900000);
-    if (cachedCharts) return ok(cachedCharts);
+  async function getRealCharts(chartType = 'songs') {
+    const browseIds = {
+      songs: 'FEmusic_chart_top_songs',
+      albums: 'FEmusic_chart_top_albums',
+      artists: 'FEmusic_chart_top_artists',
+      videos: 'FEmusic_chart_top_videos'
+    };
+    const browseId = browseIds[chartType] || browseIds.songs;
+    const cacheKey = 'charts:' + chartType;
+    const cached = ytCached(cacheKey, 3600000);
+    if (cached) return cached;
+    
     try {
-      const items = await ytSearch(query + ' songs');
-      if (items.length) return ok(ytRemember(cacheKey, items));
+      const data = await ytPost('/browse', { browseId });
+      const shelves = data?.contents?.singleColumnBrowseResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents || [];
+      const items = [];
+      const pushItem = (item) => {
+        const track = ytToTrack(item);
+        if (track) items.push(track);
+      };
+      for (const shelf of shelves) {
+        if (shelf.musicShelfRenderer?.contents) {
+          for (const item of shelf.musicShelfRenderer.contents) pushItem(item.musicResponsiveListItemRenderer || item);
+        } else if (shelf.musicCarouselShelfRenderer?.contents) {
+          for (const item of shelf.musicCarouselShelfRenderer.contents) {
+            pushItem(item.musicTwoRowItemRenderer || item.musicResponsiveListItemRenderer || item);
+          }
+        } else if (shelf.musicCardShelfRenderer) {
+          pushItem(shelf);
+        } else if (shelf.itemSectionRenderer?.contents) {
+          for (const item of shelf.itemSectionRenderer.contents) pushItem(item.musicResponsiveListItemRenderer || item);
+        }
+      }
+      
+      if (!items.length) return [];
+      ytRemember(cacheKey, items);
+      return items;
+    } catch (_) {
+      return [];
+    }
+  }
+
+  // --- Taste engine (v1.8): learns from implicit play signals ---
+  // No app changes required: every playback routes through extractAudioUrl and
+  // every radio start through getRelatedTracks, so those calls ARE the signal.
+  const TASTE_KEY = 'synthetiq_gateway_taste_v1';
+  const taste = { artists: new Map(), tracks: new Set(), sessions: 0 };
+
+  function detectStorage() {
+    try { if (globalThis.localStorage) return globalThis.localStorage; } catch (_) {}
+    return null;
+  }
+  function tasteLoad() {
+    const store = detectStorage();
+    if (!store) return;
+    try {
+      const raw = store.getItem(TASTE_KEY);
+      if (!raw) return;
+      const saved = JSON.parse(raw);
+      for (const [artist, weight] of saved.artists || []) taste.artists.set(artist, weight);
+      for (const id of saved.tracks || []) taste.tracks.add(id);
+      taste.sessions = saved.sessions || 0;
     } catch (_) {}
-    return fail('Charts unavailable.');
+  }
+  function tasteSave() {
+    const store = detectStorage();
+    if (!store) return;
+    try {
+      const artists = [...taste.artists.entries()].sort((a, b) => b[1] - a[1]).slice(0, 50);
+      const tracks = [...taste.tracks].slice(-500);
+      store.setItem(TASTE_KEY, JSON.stringify({ artists, tracks, sessions: taste.sessions, savedAt: Date.now() }));
+    } catch (_) {}
+  }
+  tasteLoad();
+  taste.sessions += 1;
+  tasteSave();
+
+  function noteImplicitPlay(trackId, weight = 1) {
+    try {
+      const id = String(trackId || '');
+      if (!id || id.startsWith('catalogue:')) return;
+      if (!/^synthetiq_music_gateway:(yt|song):/.test(id)) return;
+      taste.tracks.add(id);
+      if (taste.tracks.size > 500) taste.tracks.delete(taste.tracks.values().next().value);
+      // Artist resolution: check cached search/album/radio data first (free), else 0 cost skip.
+      // The play is still counted by track; artist is backfilled when cache has the track.
+      for (const key of YT_CACHE.keys()) {
+        const item = YT_CACHE.get(key);
+        if (Date.now() - item.time > 3600000) continue;
+        const value = item.value;
+        if (!Array.isArray(value)) continue;
+        const hit = value.find(t => t && t.id === id && t.artist && t.artist !== 'Unknown Artist');
+        if (hit) {
+          const artist = hit.artist.replace(/(,| feat\.| ft\.| &).*$/i, '').trim();
+          if (artist) {
+            taste.artists.set(artist, (taste.artists.get(artist) || 0) + weight);
+          }
+          break;
+        }
+      }
+      tasteSave();
+    } catch (_) {}
+  }
+
+  function topArtists(n = 5) {
+    return [...taste.artists.entries()].sort((a, b) => b[1] - a[1]).slice(0, n).map(([artist]) => artist);
+  }
+
+  function affinityBoost(track) {
+    if (!track) return 0;
+    let score = 0;
+    const artist = String(track.artist || '');
+    for (const [name, weight] of taste.artists) {
+      if (artist.includes(name)) score += weight;
+    }
+    return score;
+  }
+
+  function rerankByAffinity(tracks) {
+    if (!taste.artists.size || !Array.isArray(tracks)) return tracks;
+    return tracks.map(t => ({ t, s: affinityBoost(t) }))
+      .sort((a, b) => b.s - a.s)
+      .map(({ t }) => t);
+  }
+
+  function recordListen(trackId, artist, weight = 1) {
+    // Public API: kept for future app integration; feeds the same profile.
+    try {
+      if (artist && artist !== 'Unknown Artist') {
+        taste.artists.set(artist, (taste.artists.get(artist) || 0) + Number(weight || 1));
+        tasteSave();
+      }
+      if (trackId) noteImplicitPlay(trackId, Number(weight || 1));
+    } catch (_) {}
+  }
+  
+  async function getSmartRecommendations(limit = 24) {
+    const artists = topArtists(5);
+    if (!artists.length) {
+      return await getRealCharts('songs');
+    }
+
+    const allRecommended = [];
+    const dedup = new Set();
+
+    const artistPromises = artists.map(artist =>
+      ytSearchPipelined(artist + ' top songs', null, 1).catch(() => [])
+    );
+
+    const results = await Promise.all(artistPromises);
+    for (const tracks of results) {
+      for (const t of tracks) {
+        if (!dedup.has(t.id) && !taste.tracks.has(t.id)) {
+          allRecommended.push(t);
+          dedup.add(t.id);
+        }
+      }
+    }
+
+    return rerankByAffinity(allRecommended).slice(0, limit);
   }
 
   const _cipherKey = '38346591';
@@ -352,7 +586,7 @@
   async function httpGet(url) {
     const headers = {
       'Accept': 'application/json',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
+      'User-Agent': 'Mozilla/5.0'
     };
     try {
       const res = await fetch(url, { method: 'GET', headers });
@@ -416,16 +650,15 @@
     const term = String(query || '').trim();
     if (!term) return ok([]);
 
-    // 1. YouTube Music full catalog (primary) with optional filters/types
     try {
       const cacheKey = 'search:' + term + ':' + Number(page || 0) + ':' + JSON.stringify(options || null);
-      const cachedResults = ytCached(cacheKey, 300000);
-      if (cachedResults) return ok(cachedResults);
-      const tracks = await ytSearch(term, buildSearchParams(options));
-      if (tracks.length) return ok(ytRemember(cacheKey, tracks));
+      // SWR: 5-min fresh window, then serve stale (0ms) while refreshing once in background
+      const tracks = await swr(cacheKey, 300000, () =>
+        ytSearchSharded(term, buildSearchParams(options), page === 0 ? 3 : 1)
+      );
+      if (tracks?.length) return ok(rerankByAffinity(tracks));
     } catch (_) {}
 
-    // 2. ListenFree mirrors
     try {
       const p = Number(page) + 1 || 1;
       const res = await mirrorGet('/search/songs?query=' + encodeURIComponent(term) + '&page=' + p + '&limit=24');
@@ -435,7 +668,6 @@
       }
     } catch (_) {}
 
-    // 2. Try direct JioSaavn API
     try {
       const p = Number(page) + 1 || 1;
       const jio = await directJioSaavn({
@@ -453,7 +685,9 @@
     return ok([]);
   }
 
-  async function extractAudioUrl(trackId, quality) {
+  async function extractAudioUrl(trackId, quality, depth = 0) {
+    // Implicit play signal: a stream resolution IS a play (v1.8 taste engine)
+    noteImplicitPlay(trackId, 1);
     let cleanId = String(trackId || '').trim();
     let queryForFallback = null;
     let ytVideo = null;
@@ -467,7 +701,6 @@
       cleanId = cleanId.replace(/^([^:]+:song:|synthetiq_music_gateway:|synthetiq_music_hub:|saavn:|song:|track:)/, '').trim();
     }
 
-    // 1. YouTube Music stream extraction (full catalog, all regions)
     if (ytVideo) {
       const cacheKey = 'audio:' + ytVideo;
       const cachedAudio = ytCached(cacheKey, 180000);
@@ -477,7 +710,6 @@
         const audio = await ytAudio(ytVideo, quality);
         if (audio) return ok(ytRemember(cacheKey, audio));
       } catch (_) {}
-      // Fallback chain: Invidious pool, then Piped pool (health-checked, latency-routed)
       for (const pool of ['invidious', 'piped']) {
         try {
           const makeUrl = base => pool === 'invidious' ? base + '/videos/' + encodeURIComponent(ytVideo) : base + '/streams/' + encodeURIComponent(ytVideo);
@@ -498,12 +730,10 @@
           }
         } catch (_) {}
       }
-      // Negative cache so failed tracks don't re-walk every mirror for a minute
       ytRemember('audioFail:' + ytVideo, true);
       return fail('This YouTube track could not be streamed.');
     }
 
-    // 2. Direct mirror lookup by clean song ID
     if (cleanId && !cleanId.startsWith('catalogue:') && cleanId.length >= 4 && cleanId.indexOf(':') === -1) {
       try {
         const res = await mirrorGet('/songs/' + cleanId);
@@ -536,7 +766,6 @@
         }
       } catch (_) {}
 
-      // 2. Direct JioSaavn API + DES-ECB decryption
       try {
         const jioRes = await directJioSaavn({
           '__call': 'song.getDetails',
@@ -574,17 +803,18 @@
       } catch (_) {}
     }
 
-    // 3. Fallback: Search by decoded query or title to find and extract the 320kbps audio link
     const query = queryForFallback || cleanId;
     if (query && query.length > 1) {
       try {
         const searchRes = await searchResults(query, 0);
         if (searchRes.ok) {
           const items = JSON.parse(searchRes.data);
-          for (const item of items) {
-            if (item.id && item.id !== trackId) {
-              const res = await extractAudioUrl(item.id, quality);
-              if (res.ok) return res;
+          if (depth < 2) {
+            for (const item of items) {
+              if (item.id && item.id !== trackId) {
+                const res = await extractAudioUrl(item.id, quality, depth + 1);
+                if (res.ok) return res;
+              }
             }
           }
         }
@@ -595,18 +825,15 @@
   }
 
   async function extractDetails(id) {
-    // Strip any chain of known ID prefixes: synthetiq_music_gateway:album:MPREb_x -> MPREb_x
     const KNOWN_PREFIXES = ['synthetiq_music_gateway', 'synthetiq_music_hub', 'freefy', 'album', 'playlist', 'artist', 'yt', 'song', 'track'];
     const cleanId = String(id || '').split(':').filter(part => part && !KNOWN_PREFIXES.includes(part)).join(':').trim();
 
-    // 1. YouTube album via browse (full ordered tracklist)
     if (cleanId.startsWith('MPRE')) {
       const cacheKey = 'album:' + cleanId;
       const cachedAlbum = ytCached(cacheKey, 3600000);
       if (cachedAlbum) return ok(cachedAlbum);
       try {
         const data = await ytPost('/browse', { browseId: cleanId });
-        // Album pages come in two layouts: two-column (current) and single-column
         const two = data?.contents?.twoColumnBrowseResultsRenderer;
         const single = data?.contents?.singleColumnBrowseResultsRenderer;
         const headerSection = (two?.tabs?.[0] || single?.tabs?.[0])?.tabRenderer?.content?.sectionListRenderer?.contents?.[0] || {};
@@ -655,7 +882,6 @@
       return fail('Album details unavailable.');
     }
 
-    // 2. ListenFree mirrors
     try {
       const res = await mirrorGet('/albums?id=' + encodeURIComponent(cleanId));
       const data = res?.data;
@@ -681,44 +907,101 @@
     return ok(parsed.tracks || []);
   }
 
+  // Response budget guard: stop adding shelves once projected JSON nears the
+  // app's 512KB maxResponseBytes cap (soft 450KB target), trimming lowest priority.
+  const HOME_BUDGET_BYTES = 450000;
+  function withinBudget(sections) {
+    try {
+      let size = JSON.stringify(sections).length * 2; // conservative UTF-16 estimate
+      return size <= HOME_BUDGET_BYTES;
+    } catch (_) { return true; }
+  }
+
+  // New-release radar: query known artists with an upload-date filter so fresh
+  // drops surface without the app needing a follow list.
+  async function getNewReleases(limit = 12) {
+    const artists = topArtists(3);
+    if (!artists.length) return [];
+    const results = await Promise.allSettled(artists.map(artist =>
+      ytSearchPipelined(artist + ' new song', SEARCH_FILTERS.uploadDate.thisMonth, 1)
+    ));
+    const out = [];
+    const dedup = new Set();
+    for (const r of results) {
+      if (r.status !== 'fulfilled') continue;
+      for (const t of r.value) {
+        if (!dedup.has(t.id) && !taste.tracks.has(t.id)) {
+          out.push(t);
+          dedup.add(t.id);
+        }
+      }
+    }
+    return out.slice(0, limit);
+  }
+
+  // Trending within the user's taste genres: intersect charts with top artists
+  async function getTrendingInTaste(limit = 12) {
+    const artists = topArtists(5);
+    if (!artists.length) return [];
+    const charts = await getRealCharts('songs');
+    if (!charts?.length) return [];
+    const scored = charts
+      .filter(t => !taste.tracks.has(t.id))
+      .map(t => ({ t, s: affinityBoost(t) }))
+      .filter(x => x.s > 0)
+      .sort((a, b) => b.s - a.s);
+    return scored.slice(0, limit).map(({ t }) => t);
+  }
+
   async function homeSections(page) {
     if (Number(page) > 0) return ok([]);
-    const sections = [];
-    // 1. YouTube Music charts (real trending, refreshed by YouTube) — fetched in parallel
-    try {
-      const cachedSections = ytCached('home', 900000);
-      if (cachedSections) return ok(cachedSections);
-      const chartJobs = await Promise.allSettled([
-        ytPost('/search', { query: 'trending music hits', params: 'Ege4w7uDmZoHAxIQk7LNpI0RUq5cUNhSYQ%3D%3D' }).catch(() => null),
-        ytPost('/search', { query: 'top music videos', params: 'Ege4w7uDmZoHAxIQk7LNpI0RUq5cUNhSYQ%3D%3D' }).catch(() => null)
-      ]);
-      const titles = ['Trending Worldwide', 'Top Music Videos'];
-      chartJobs.forEach((job, index) => {
-        if (job.status !== 'fulfilled' || !job.value) return;
-        const items = (job.value?.contents?.tabbedSearchResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents || [])
-          .flatMap(section => section.musicShelfRenderer?.contents || [])
-          .map(item => ytToTrack(item.musicResponsiveListItemRenderer || item)).filter(Boolean);
-        if (items.length) sections.push({ title: titles[index], type: 'track', items: items.slice(0, 24) });
-      });
-    } catch (_) {}
-    // 2. Search-based fallback sections — also parallel
-    if (sections.length < 3) {
-      const queries = [
-        { title: 'Top Hits & Trending', query: 'top hits' },
-        { title: 'New Releases', query: 'latest songs' },
-        { title: 'Popular Worldwide', query: 'global hits' }
-      ];
-      const results = await Promise.all(queries.map(row => searchResults(row.query, 0).catch(() => null)));
-      results.forEach((result, index) => {
-        if (!result || !result.ok || sections.length >= 3) return;
-        const items = JSON.parse(result.data);
-        if (items.length) sections.push({ title: queries[index].title, type: 'track', items: items.slice(0, 12) });
-      });
-    }
-    return sections.length ? ok(sections) : fail('Music discovery is temporarily unavailable.');
+    const buildSections = async () => {
+      const sections = [];
+      try {
+        const chartsPromise = getRealCharts('songs');
+        const trendingPromise = ytPost('/search', { query: 'trending music hits', params: 'Ege4w7uDmZoHAxIQk7LNpI0RUq5cUNhSYQ%3D%3D' }).catch(() => null);
+        const smartPromise = getSmartRecommendations(24);
+        const radarPromise = getNewReleases(12);
+        const tasteTrendPromise = getTrendingInTaste(12);
+
+        const [charts, trendingData, smart, radar, tasteTrend] = await Promise.all([
+          chartsPromise, trendingPromise, smartPromise, radarPromise, tasteTrendPromise
+        ]);
+
+        if (radar?.length) {
+          sections.push({ title: 'New Releases From Your Artists', type: 'track', items: radar });
+        }
+        if (tasteTrend?.length) {
+          sections.push({ title: 'Trending In Your Taste', type: 'track', items: tasteTrend });
+        }
+        if (charts?.length) {
+          sections.push({ title: 'Charts & Top Hits', type: 'track', items: charts.slice(0, 24) });
+        }
+
+        if (trendingData) {
+          const items = (trendingData?.contents?.tabbedSearchResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents || [])
+            .flatMap(section => section.musicShelfRenderer?.contents || [])
+            .map(item => ytToTrack(item.musicResponsiveListItemRenderer || item)).filter(Boolean).map(slimTrack);
+          if (items.length) sections.push({ title: 'Trending Worldwide', type: 'track', items: items.slice(0, 24) });
+        }
+
+        if (smart?.length && taste.artists.size > 0) {
+          sections.push({ title: 'For You (Your Taste)', type: 'track', items: smart });
+        }
+
+        // Budget guard: drop lowest-priority shelves (end of array) until within budget
+        while (sections.length > 1 && !withinBudget(sections)) sections.pop();
+      } catch (_) {}
+      return sections;
+    };
+    // SWR for home: fresh 15 min, stale served at 0ms while revalidating
+    const sections = await swr('home', 900000, buildSections);
+    return sections?.length ? ok(sections) : fail('Music discovery is temporarily unavailable.');
   }
 
   async function getRelatedTracks(seedId) {
+    // Stronger signal: the user explicitly asked for more like this
+    noteImplicitPlay(seedId, 1.5);
     const seed = String(seedId || '').trim();
     let ytVideo = null;
     if (/^(synthetiq_music_gateway|synthetiq_music_hub|freefy):yt:/.test(seed)) {
@@ -726,34 +1009,32 @@
     } else if (seed && !seed.startsWith('catalogue:') && seed.indexOf(':') === -1 && seed.length >= 8) {
       ytVideo = seed;
     }
-    // 1. YouTube radio engine (real recommendations from the seed track)
     if (ytVideo) {
       const cacheKey = 'radio:' + ytVideo;
       const cachedRadio = ytCached(cacheKey, 1800000);
       if (cachedRadio) return ok(cachedRadio);
+      const seedQualified = 'synthetiq_music_gateway:yt:' + ytVideo;
       try {
         const tracks = await ytRadio(ytVideo);
-        if (tracks.length) return ok(ytRemember(cacheKey, tracks.filter(t => t.id !== seedId)));
+        if (tracks.length) return ok(ytRemember(cacheKey, tracks.filter(t => t.id !== seedQualified && t.id !== seedId)));
       } catch (_) {}
     }
-    // 2. Seed by searching the track title, then build radio from top hit
     if (seed.startsWith('catalogue:')) {
       const query = parseTrackQuery(seed);
       if (query) {
         try {
-          const results = await ytSearch(query);
+          const results = await ytSearchPipelined(query, null, 1);
           if (results.length) return getRelatedTracks(results[0].id);
         } catch (_) {}
       }
     }
-    // 3. Fallback: same-artist tracks via YouTube search
     if (ytVideo) {
       try {
-        const details = await ytSearch(ytVideo);
+        const details = await ytSearchPipelined(ytVideo, null, 1);
         if (details.length) {
           const artist = details[0].artist;
-          const tracks = await ytSearch(artist);
-          if (tracks.length) return ok(tracks.filter(t => t.id !== seedId));
+          const tracks = await ytSearchPipelined(artist, null, 2);
+          if (tracks.length) return ok(tracks.filter(t => t.id !== seedId && t.id !== 'synthetiq_music_gateway:yt:' + ytVideo));
         }
       } catch (_) {}
     }
@@ -766,13 +1047,13 @@
   globalThis.extractTracks = extractTracks;
   globalThis.extractAudioUrl = extractAudioUrl;
   globalThis.getRelatedTracks = getRelatedTracks;
+  globalThis.getSmartRecommendations = getSmartRecommendations;
+  globalThis.recordListen = recordListen;
 
-  // --- Advanced search with filters and result types ---
   async function searchAdvanced(query, options) {
     return searchResults(query, 0, options);
   }
 
-  // --- Synced/static lyrics: YouTube native, LRCLIB fallback ---
   async function getLyrics(trackId) {
     const seed = String(trackId || '').trim();
     let ytVideo = null;
@@ -796,7 +1077,6 @@
     }
     let query = seed.startsWith('catalogue:') ? parseTrackQuery(seed) : null;
     if (!query && ytVideo) {
-      // Resolve the track title from the /next endpoint (works without login)
       try {
         const next = await ytPost('/next', { videoId: ytVideo });
         const panel = next?.contents?.singleColumnMusicWatchNextResultsRenderer?.tabbedRenderer?.watchNextTabbedResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.musicQueueRenderer?.content?.playlistPanelRenderer;
@@ -807,7 +1087,7 @@
       } catch (_) {}
       if (!query) {
         try {
-          const results = await ytSearch(ytVideo);
+          const results = await ytSearchPipelined(ytVideo, null, 1);
           if (results.length) query = (results[0].title.replace(/\((official|lyric|audio|video).*$/i, '').trim() + ' ' + results[0].artist).trim();
         } catch (_) {}
       }
@@ -832,10 +1112,9 @@
     return fail('Lyrics unavailable.');
   }
 
-  // --- Artist pages: top tracks, albums, singles, related artists ---
   async function getArtist(artistId) {
     const clean = String(artistId || '').trim().replace(/^(synthetiq_music_gateway|freefy):(artist:)?/, '');
-    if (!clean || !clean.startsWith('UC') && clean.indexOf(':') !== -1) return fail('Artist ID required.');
+    if (!clean || !/^(UC|MPUC)[A-Za-z0-9_-]{10,}$/.test(clean)) return fail('Artist ID required.');
     const cacheKey = 'artist:' + clean;
     const cachedArtist = ytCached(cacheKey, 3600000);
     if (cachedArtist) return ok(cachedArtist);
@@ -880,7 +1159,6 @@
     return fail('Artist unavailable.');
   }
 
-  // --- Playlists: browse YouTube Music playlists (VL/PL browse IDs) ---
   async function getPlaylist(playlistId) {
     let browseId = String(playlistId || '').trim().replace(/^(synthetiq_music_gateway|freefy):(playlist:)?/, '');
     if (!browseId) return fail('Playlist ID required.');
@@ -919,7 +1197,6 @@
         }));
       }
     } catch (_) {}
-    // Fallback: the /next queue endpoint returns playlist contents anonymously
     try {
       const plainId = browseId.replace(/^VL/, '');
       const data = await ytPost('/next', { playlistId: plainId });
@@ -947,6 +1224,4 @@
   globalThis.getLyrics = getLyrics;
   globalThis.getArtist = getArtist;
   globalThis.getPlaylist = getPlaylist;
-  globalThis.getGenreCharts = getGenreCharts;
 })();
-
