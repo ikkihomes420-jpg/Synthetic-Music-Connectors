@@ -11,7 +11,7 @@
       "version": "1.9.1",
       "releaseTrack": "production",
       "file": "packages/Synthetiq-Music-Gateway-1.9.1.zip",
-      "sha256": "791a40878f0c9fa243147b8de8fd28a4000879975a0dcb1dc748a6574a4823ef",
+      "sha256": "2e1e115fcada2d4fe217f9f65bdd8052db65be24bcc341e02134d0619bed7239",
       "publishedAt": "2026-09-13T08:30:00Z",
       "changelog": [
         "Fix: Package layout corrected \u2014 files restored under modules/synthetiq_music_gateway/ so the host can locate runtime entry index.js (module was not recognized).",
