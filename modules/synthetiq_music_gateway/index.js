@@ -134,7 +134,18 @@
         }
       }
     }
-    return { tracks, continuation: data?.contents?.tabbedSearchResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.continuations?.[0]?.nextContinuationData?.continuation };
+    const slr = data?.contents?.tabbedSearchResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer;
+    const shelfContinuation = sections.find(section => section.musicShelfRenderer?.continuations)?.musicShelfRenderer?.continuations?.[0]?.nextContinuationData?.continuation;
+    return { tracks, continuation: slr?.continuations?.[0]?.nextContinuationData?.continuation || shelfContinuation };
+  }
+
+  // Continuation pages land in continuationContents.musicShelfContinuation,
+  // a different shape from the initial search response.
+  function extractContinuationTracks(data) {
+    const shelf = data?.continuationContents?.musicShelfContinuation;
+    const tracks = (shelf?.contents || []).map(item => ytToTrack(item.musicResponsiveListItemRenderer || item)).filter(Boolean);
+    const continuation = shelf?.continuations?.[0]?.nextContinuationData?.continuation || null;
+    return { tracks, continuation };
   }
 
   async function ytSearchPipelined(term, params, pageCount = 3) {
@@ -155,7 +166,7 @@
     
     let page2Promise = ytPost('/search', { continuation: cont1 });
     let page2Data = await page2Promise;
-    const { tracks: tracks2, continuation: cont2 } = extractSearchTracks(page2Data);
+    const { tracks: tracks2, continuation: cont2 } = extractContinuationTracks(page2Data);
     for (const t of tracks2) {
       if (!dedup.has(t.id)) {
         allTracks.push(t);
@@ -166,7 +177,7 @@
     if (pageCount <= 2 || !cont2) return allTracks;
     
     let page3Data = await ytPost('/search', { continuation: cont2 });
-    const { tracks: tracks3 } = extractSearchTracks(page3Data);
+    const { tracks: tracks3 } = extractContinuationTracks(page3Data);
     for (const t of tracks3) {
       if (!dedup.has(t.id)) {
         allTracks.push(t);
