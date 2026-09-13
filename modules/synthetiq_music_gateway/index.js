@@ -284,37 +284,75 @@
     return parts.length ? parts[0] : undefined;
   }
 
+  // Live charts source: the legacy per-type browseIds (FEmusic_chart_top_*)
+  // return 400; the charts page is now FEmusic_charts with carousels whose
+  // items are chart playlists. For 'songs' we resolve the most relevant chart
+  // playlist and return its real track list; other types map to carousels.
+  function pickChartPlaylist(carousel) {
+    const entries = (carousel?.contents || [])
+      .map(item => item.musicTwoRowItemRenderer)
+      .filter(Boolean)
+      .map(two => ({ title: ytText(two.title?.runs), browseId: two.navigationEndpoint?.browseEndpoint?.browseId }))
+      .filter(e => e.browseId);
+    const score = e => /trending 20/i.test(e.title) ? 3 : /daily top/i.test(e.title) ? 2 : /top \d+/i.test(e.title) ? 1 : 0;
+    return entries.sort((a, b) => score(b) - score(a))[0] || null;
+  }
   async function getRealCharts(chartType = 'songs') {
-    const browseIds = {
-      songs: 'FEmusic_chart_top_songs',
-      albums: 'FEmusic_chart_top_albums',
-      artists: 'FEmusic_chart_top_artists',
-      videos: 'FEmusic_chart_top_videos'
-    };
-    const browseId = browseIds[chartType] || browseIds.songs;
     const cacheKey = 'charts:' + chartType;
     const cached = ytCached(cacheKey, 3600000);
     if (cached) return cached;
     
     try {
-      const data = await ytPost('/browse', { browseId });
+      const data = await ytPost('/browse', { browseId: 'FEmusic_charts' });
       const shelves = data?.contents?.singleColumnBrowseResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents || [];
       const items = [];
       const pushItem = (item) => {
         const track = ytToTrack(item);
         if (track) items.push(track);
       };
-      for (const shelf of shelves) {
-        if (shelf.musicShelfRenderer?.contents) {
-          for (const item of shelf.musicShelfRenderer.contents) pushItem(item.musicResponsiveListItemRenderer || item);
-        } else if (shelf.musicCarouselShelfRenderer?.contents) {
-          for (const item of shelf.musicCarouselShelfRenderer.contents) {
-            pushItem(item.musicTwoRowItemRenderer || item.musicResponsiveListItemRenderer || item);
+      const carouselTitle = carousel => ytText(carousel?.header?.musicCarouselShelfBasicHeaderRenderer?.title?.runs);
+      const carouselFor = type => shelves.find(s => {
+        const t = carouselTitle(s.musicCarouselShelfRenderer).toLowerCase();
+        return type === 'albums' ? t.includes('album') : type === 'artists' ? t.includes('artist') : type === 'videos' ? t.includes('video') : false;
+      })?.musicCarouselShelfRenderer;
+      
+      if (chartType === 'albums' || chartType === 'artists' || chartType === 'videos') {
+        const carousel = carouselFor(chartType);
+        if (carousel?.contents) {
+          for (const item of carousel.contents) pushItem(item.musicTwoRowItemRenderer || item.musicResponsiveListItemRenderer || item);
+        }
+      } else {
+        // 'songs': resolve the strongest chart playlist and pull its real tracks
+        let best = null;
+        for (const shelf of shelves) {
+          const carousel = shelf.musicCarouselShelfRenderer;
+          if (!carousel?.contents) continue;
+          const pick = pickChartPlaylist(carousel);
+          if (pick) {
+            const rank = /trending 20/i.test(pick.title) ? 3 : /daily top/i.test(pick.title) ? 2 : /top \d+/i.test(pick.title) ? 1 : 0;
+            if (!best || rank > best.rank) best = { ...pick, rank };
           }
-        } else if (shelf.musicCardShelfRenderer) {
-          pushItem(shelf);
-        } else if (shelf.itemSectionRenderer?.contents) {
-          for (const item of shelf.itemSectionRenderer.contents) pushItem(item.musicResponsiveListItemRenderer || item);
+        }
+        if (best) {
+          try {
+            const pl = await getPlaylist(best.browseId);
+            if (pl?.ok) {
+              const parsed = JSON.parse(pl.data);
+              for (const track of parsed.tracks || []) items.push(track);
+            }
+          } catch (_) {}
+        }
+        if (!items.length) {
+          // last resort: flatten any direct track lists on the charts page
+          for (const shelf of shelves) {
+            if (shelf.musicShelfRenderer?.contents) {
+              for (const item of shelf.musicShelfRenderer.contents) pushItem(item.musicResponsiveListItemRenderer || item);
+            } else if (shelf.musicCarouselShelfRenderer?.contents) {
+              for (const item of shelf.musicCarouselShelfRenderer.contents) {
+                pushItem(item.musicTwoRowItemRenderer || item.musicResponsiveListItemRenderer || item);
+              }
+            }
+          }
         }
       }
       
@@ -959,7 +997,7 @@
       const sections = [];
       try {
         const chartsPromise = getRealCharts('songs');
-        const trendingPromise = ytPost('/search', { query: 'trending music hits', params: 'Ege4w7uDmZoHAxIQk7LNpI0RUq5cUNhSYQ%3D%3D' }).catch(() => null);
+        const trendingPromise = ytPost('/search', { query: 'trending music hits', params: SEARCH_FILTERS.type.songs }).catch(() => null);
         const smartPromise = getSmartRecommendations(24);
         const radarPromise = getNewReleases(12);
         const tasteTrendPromise = getTrendingInTaste(12);
@@ -980,7 +1018,11 @@
 
         if (trendingData) {
           const items = (trendingData?.contents?.tabbedSearchResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents || [])
-            .flatMap(section => section.musicShelfRenderer?.contents || [])
+            .flatMap(section =>
+              section.musicShelfRenderer?.contents
+              || (section.musicCardShelfRenderer ? [section] : [])
+              || (section.itemSectionRenderer?.contents || []).map(inner => inner.musicResponsiveListItemRenderer || inner).filter(Boolean)
+            )
             .map(item => ytToTrack(item.musicResponsiveListItemRenderer || item)).filter(Boolean).map(slimTrack);
           if (items.length) sections.push({ title: 'Trending Worldwide', type: 'track', items: items.slice(0, 24) });
         }
