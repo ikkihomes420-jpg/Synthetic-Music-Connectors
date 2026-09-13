@@ -11,15 +11,12 @@
       "version": "1.10.0",
       "releaseTrack": "production",
       "file": "modules_fixed/synthetiq_music_gateway/fast.js",
-      "sha256": "runtime-source",
-      "publishedAt": "2026-09-13T00:00:00Z",
+      "sha256": "7c4da584b4edddbc1755b8e51f5822f9339fd77d7b634ac0b1fa4cb25044a1aa",
       "changelog": [
-        "Performance: new low-latency runtime targets sub-second cached search/playback and keeps foreground network operations bounded below three seconds.",
-        "Fix: search continuation parsing accepts multiple live YouTube Music response shapes and expands up to 150 tracks instead of remaining at the first batch.",
-        "Fix: search pages return their own 50-track slice from the shared result set instead of repeating page 1.",
-        "Performance: playback resolutions are deduplicated and cached, with automatic next-track prefetch from the active search result set.",
-        "Performance: Home returns cached shelves immediately and refreshes in the background.",
-        "Compatibility: original gateway exports and legacy index.js remain intact; fast.js is now the production runtime entry point."
+        "Fix: catalog SHA-256 now matches the exact 1.10.0 runtime file.",
+        "Performance: progressive search and continuation expansion target sub-second first paint and up to 150 results.",
+        "Performance: playback routes race in parallel and resolved streams are cached for rapid skipping.",
+        "Performance: Home is cache-first with background refresh."
       ]
     },
     {
@@ -31,11 +28,7 @@
       "version": "1.9.2",
       "releaseTrack": "production",
       "file": "packages/Synthetiq-Music-Gateway-1.9.2.zip",
-      "sha256": "b649896c58448a2232398f067454b1125e59f46bc38a8b1ef4ae77abb2af7436",
-      "publishedAt": "2026-09-13T09:30:00Z",
-      "changelog": [
-        "Previous production release retained for rollback."
-      ]
+      "sha256": "b649896c58448a2232398f067454b1125e59f46bc38a8b1ef4ae77abb2af7436"
     }
   ]
 }
