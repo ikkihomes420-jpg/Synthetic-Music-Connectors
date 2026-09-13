@@ -10,7 +10,7 @@ resolved audio URLs, request headers, or downloaded audio.
 
 In Synthetiq Music, open **Settings → Sources → Advanced**, then paste:
 
-`https://github.com/kas021/Synthetic-Music-Connectors`
+`https://github.com/ikkihomes420-jpg/Synthetic-Music-Connectors`
 
 The app downloads the package named by `catalogue.json`, verifies its SHA-256,
 and installs it as a user-selected source.
