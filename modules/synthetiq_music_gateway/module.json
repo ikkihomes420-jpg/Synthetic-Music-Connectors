@@ -1,12 +1,12 @@
 {
   "id": "synthetiq-music-gateway-v1",
   "name": "Synthetiq Music Gateway",
-  "description": "Unified music search and playback: YouTube Music catalog with resilient streaming, radio, albums, lyrics, and charts; multi-source fallbacks.",
+  "description": "Unified music search and playback: YouTube Music catalog with pipelined sharded search, SWR caching, self-learning taste engine (implicit play signals), new-release radar, real charts, resilient streaming, radio, albums, lyrics, and artist pages.",
   "type": "client",
   "contentType": "music",
   "contractVersion": 4,
   "formatVersion": 3,
-  "moduleVersion": "1.6.1",
+  "moduleVersion": "1.8.1",
   "moduleFamilyId": "synthetiq_music_gateway",
   "moduleIdentity": "SP-MUS-3006-MUSIC-GATEWAY",
   "moduleIdentityNumber": 3006,
@@ -17,36 +17,31 @@
       "music_home_v1": true,
       "local_listening_stats_v1": true,
       "search_filters_v1": true,
+      "search_pagination_v1": true,
       "album_view_v1": true,
       "playlist_view_v1": true,
       "artist_profiles_v1": true,
       "lyrics_v1": true,
       "radio_v1": true,
-      "genre_charts_v1": true,
-      "offline_download_v1": true
+      "real_charts_v1": true,
+      "taste_recommendations_v1": true,
+      "offline_download_v1": true,
+      "release_radar_v1": true
     },
     "runtime": {
       "mode": "local",
       "entry": "index.js"
     },
     "caps": {
-      "homeMaxResults": 24,
+      "homeMaxResults": 48,
       "maxResponseBytes": 524288,
-      "timeoutMs": 10000,
-      "maxConcurrentRequests": 4
+      "timeoutMs": 12000,
+      "maxConcurrentRequests": 4,
+      "searchPaginationPages": 3,
+      "cacheStrategy": "stale-while-revalidate-lru"
     },
     "playbackMode": "full",
     "allowOfflineDownload": true
   },
-  "moduleStatus": "production",
-  "capabilities": {
-    "music_home_v1": true,
-    "local_listening_stats_v1": true
-  },
-  "caps": {
-    "homeMaxResults": 24,
-    "maxResponseBytes": 524288,
-    "timeoutMs": 12000,
-    "maxConcurrentRequests": 2
-  }
+  "moduleStatus": "production"
 }
