@@ -13,17 +13,121 @@
   const CACHE_MAX = 300;
   const YT_CONTEXT = { client: { clientName: 'WEB_REMIX', clientVersion: '1.20240101.01.00', hl: 'en', gl: 'US' } };
 
+  // --- v1.9.2 latency budget -------------------------------------------------
+  // Every network path is time-boxed. The old httpGet() had no timeout at all,
+  // so one stalled mirror could park a play/search request for minutes.
+  const YT_TIMEOUT_MS = 5000;
+  const MIRROR_TIMEOUT_MS = 4000;
+  const SEARCH_TTL_MS = 300000;
+  const AUDIO_TTL_MS = 900000;
+  const SEARCH_FIRST_PAINT_MS = 1100;
+  const SEARCH_FIRST_PAINT_TRACKS = 40;
+  const SEARCH_EXPAND_WAIT_MS = 2200;
+  const HOME_SOFT_DEADLINE_MS = 1300;
+  const HOME_HARD_DEADLINE_MS = 3500;
+  const SEARCH_MAX_TRACKS = 150;
+  const SEARCH_STATE_MAX = 40;
+
+  function timeoutSignal(ms) {
+    try { return AbortSignal.timeout(ms); } catch (_) {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), ms);
+      return controller.signal;
+    }
+  }
+
+  // Poll a cheap predicate so callers can bail out early instead of always
+  // waiting for the worst case.
+  function waitFor(predicate, timeoutMs) {
+    return new Promise(resolve => {
+      if (predicate()) return resolve(true);
+      const started = Date.now();
+      const tick = () => {
+        if (predicate()) return resolve(true);
+        if (Date.now() - started >= timeoutMs) return resolve(false);
+        setTimeout(tick, 20);
+      };
+      setTimeout(tick, 20);
+    });
+  }
+
+  // Bounded concurrency + priority, applied at the fetch layer only: playback
+  // (0) always beats catalogue/search/home work (1).
+  const MAX_CONCURRENT_REQUESTS = 6;
+  let activeRequests = 0;
+  const requestQueue = [];
+  function schedule(priority, run) {
+    return new Promise((resolve, reject) => {
+      const task = { priority: priority || 0, run, resolve, reject };
+      let i = requestQueue.length;
+      while (i > 0 && requestQueue[i - 1].priority > task.priority) i--;
+      requestQueue.splice(i, 0, task);
+      pumpRequests();
+    });
+  }
+  function pumpRequests() {
+    while (activeRequests < MAX_CONCURRENT_REQUESTS && requestQueue.length) {
+      const task = requestQueue.shift();
+      activeRequests++;
+      Promise.resolve()
+        .then(task.run)
+        .then(task.resolve, task.reject)
+        .finally(() => { activeRequests--; pumpRequests(); });
+    }
+  }
+
+  // In-flight dedupe: skipping tracks quickly used to fire identical requests
+  // over and over, and every one of them raced to slow the next one down.
+  const inflight = new Map();
+  function dedupe(key, run) {
+    const hit = inflight.get(key);
+    if (hit) return hit;
+    const promise = Promise.resolve().then(run).finally(() => inflight.delete(key));
+    inflight.set(key, promise);
+    return promise;
+  }
+
   // LRU-capped cache: touch on read, evict oldest on insert
   const CACHE_MAX_BYTES = 10485760; // 10MB hard limit
   let cacheBytesUsed = 0;
   
+  // Cheap structural estimate. The old version JSON.stringify()'d the whole
+  // value on every cache write, which cost hundreds of KB of stringify work per
+  // home/search cache set - measured as main-thread jank on track changes.
   function estimateCacheBytes(value) {
-    if (!value) return 100;
-    if (typeof value === 'string') return value.length;
-    try {
-      return JSON.stringify(value).length * 2;  // UTF-16 estimate
-    } catch (_) {
-      return 1000;
+    if (value == null) return 64;
+    if (typeof value === 'string') return value.length * 2;
+    if (typeof value === 'number' || typeof value === 'boolean') return 16;
+    if (Array.isArray(value)) {
+      let total = 48;
+      for (const item of value) total += estimateItemBytes(item);
+      return total;
+    }
+    let total = 96;
+    if (Array.isArray(value.tracks)) total += estimateCacheBytes(value.tracks);
+    for (const field of ['url', 'title', 'artist', 'album', 'artwork', 'mimeType']) {
+      if (typeof value[field] === 'string') total += value[field].length * 2;
+    }
+    return total;
+  }
+
+  function estimateItemBytes(item) {
+    if (!item || typeof item !== 'object') return 16;
+    return 110 + String(item.id || '').length + String(item.title || '').length
+      + String(item.artist || '').length + String(item.image || item.artwork || '').length;
+  }
+
+  // Artist lookup index: play signals resolve in O(1) instead of scanning every
+  // cached array on every single play.
+  const trackArtists = new Map();
+  function indexTrackArtists(value) {
+    const list = Array.isArray(value) ? value : (Array.isArray(value && value.tracks) ? value.tracks : null);
+    if (!list) return;
+    if (trackArtists.size > 3000) trackArtists.clear();
+    for (const item of list) {
+      if (item && item.id && item.artist && item.artist !== 'Unknown Artist' && !trackArtists.has(item.id)) {
+        trackArtists.set(item.id, item.artist);
+      }
     }
   }
   
@@ -39,6 +143,7 @@
     // Create new entry with size
     const size = estimateCacheBytes(value);
     const entry = { time: Date.now(), value, size };
+    indexTrackArtists(value);
     
     YT_CACHE.set(key, entry);
     cacheBytesUsed += size;
@@ -66,61 +171,40 @@
     if (Date.now() - item.time < ttl) { YT_CACHE.delete(key); YT_CACHE.set(key, item); return item.value; }
     return null;
   };
-  const ytStale = (key) => YT_CACHE.get(key)?.value ?? null;
   const ytRefreshing = new Set();
-  // Stale-while-revalidate: serve stale instantly, refresh once in background
-  async function swr(key, ttl, refresh) {
+  const dirtyKeys = new Set();
+  const markStale = key => { dirtyKeys.add(key); };
+
+  // One in-flight rebuild per key; the caller never waits for it.
+  function refreshInBackground(key, refresh) {
+    if (ytRefreshing.has(key)) return;
+    ytRefreshing.add(key);
+    Promise.resolve()
+      .then(() => refresh())
+      .then(value => { if (value) ytRemember(key, value); })
+      .catch(() => {})
+      .finally(() => { ytRefreshing.delete(key); dirtyKeys.delete(key); });
+  }
+
+  // Fresh -> cached value. Stale -> cached value now, rebuild in background.
+  // Cold -> the shared rebuild promise, so concurrent callers never get null.
+  function readThrough(key, ttl, refresh) {
     const cached = YT_CACHE.get(key);
-    const now = Date.now();
-    
-    // If we have cached data, check if it's fresh or stale
     if (cached) {
-      const age = now - cached.time;
-      
-      if (age < ttl) {
-        // Fresh! Return immediately and touch for LRU
+      const fresh = (Date.now() - (cached.time || 0)) < ttl && !dirtyKeys.has(key);
+      if (fresh) {
         YT_CACHE.delete(key);
         YT_CACHE.set(key, cached);
-        return cached.value;
+        return Promise.resolve(cached.value);
       }
-      
-      // Stale but we have it. Return immediately, refresh in background.
-      if (!ytRefreshing.has(key)) {
-        ytRefreshing.add(key);
-        // Fire and forget - don't wait
-        refresh()
-          .then(value => {
-            if (value) ytRemember(key, value);
-          })
-          .catch(() => {
-            // Silently ignore refresh failures
-          })
-          .finally(() => {
-            ytRefreshing.delete(key);
-          });
-      }
-      
-      // Return stale value IMMEDIATELY (don't wait for refresh)
-      return cached.value;
+      refreshInBackground(key, refresh);
+      return Promise.resolve(cached.value);
     }
-    
-    // No cache at all - must fetch
-    if (ytRefreshing.has(key)) {
-      // Someone else is refreshing - return null
-      return null;
-    }
-    
-    ytRefreshing.add(key);
-    try {
+    return dedupe('rt:' + key, async () => {
       const value = await refresh();
       if (value) ytRemember(key, value);
       return value;
-    } catch (_) {
-      // Refresh failed with no cache - that's ok
-      return null;
-    } finally {
-      ytRefreshing.delete(key);
-    }
+    });
   }
   const slimTrack = t => {
     if (!t) return t;
@@ -131,18 +215,28 @@
     return out;
   };
   
-  async function ytPost(path, body) {
-    const doFetch = async () => {
-      const res = await fetch(YT_API + path + '?alt=json', {
-        method: 'POST',
-        signal: AbortSignal.timeout(8000),
-        headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': 'Mozilla/5.0' },
-        body: JSON.stringify({ context: YT_CONTEXT, ...body })
-      });
-      if (!res.ok) throw new Error('YT HTTP ' + res.status);
-      return res.json();
-    };
-    try { return await doFetch(); } catch (_) { return doFetch(); }
+  async function ytPost(path, body, priority) {
+    const payload = JSON.stringify({ context: YT_CONTEXT, ...body });
+    return dedupe('yt:' + path + ':' + payload, () => schedule(priority == null ? 1 : priority, async () => {
+      const request = async () => {
+        const res = await fetch(YT_API + path + '?alt=json', {
+          method: 'POST',
+          signal: timeoutSignal(YT_TIMEOUT_MS),
+          headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': 'Mozilla/5.0' },
+          body: payload
+        });
+        if (!res.ok) throw new Error('YT HTTP ' + res.status);
+        return res.json();
+      };
+      try {
+        return await request();
+      } catch (error) {
+        // Retry once for transient failures, but never after a timeout: the
+        // old 8s + 8s retry chain is what made a bad network feel frozen.
+        if (error && (error.name === 'TimeoutError' || error.name === 'AbortError')) throw error;
+        return await request();
+      }
+    }));
   }
   
   function ytText(value) { return Array.isArray(value) ? value.map(item => item.text || '').join('') : String(value || ''); }
@@ -171,12 +265,17 @@
     if (!videoId && !browseId) return null;
     const isCollection = !videoId && browseId;
     const columns = source.flexColumns || [];
+    // Queue entries (playlistPanelVideoRenderer, used by radio and the /next
+    // response) carry their title in title.runs and the artist in the byline,
+    // not in flexColumns - without these fallbacks every radio row came back as
+    // "Track / Unknown Artist", which also starved the taste engine.
     const runs = columns[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs
-      || (isCard ? card.title?.runs : isTwoRow ? item.title?.runs : []);
+      || (isCard ? card.title?.runs : (item.title?.runs || []));
     const sub = columns[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs
-      || (isCard ? card.subtitle?.runs : isTwoRow ? item.subtitle?.runs : []);
+      || (isCard ? card.subtitle?.runs : (item.subtitle?.runs || item.longBylineText?.runs || item.shortBylineText?.runs || []));
     const thumbs = source.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || card?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || (isTwoRow ? item.thumbnailRenderer?.musicThumbnailRenderer?.thumbnail?.thumbnails : undefined);
-    const durationMatch = ytText(sub[sub.length - 1]?.text).match(/(\d+):(\d+)/);
+    const durationMatch = ytText(sub[sub.length - 1]?.text).match(/(\d+):(\d+)/)
+      || ytText(item.lengthText?.runs || item.durationText?.runs).match(/(\d+):(\d+)/);
     const rawId = videoId || browseId;
     const kind = isCollection
       ? (browseId.startsWith('MPRE') ? 'album' : browseId.startsWith('MPUC') || browseId.startsWith('UC') ? 'artist' : 'playlist')
@@ -266,30 +365,101 @@
     return allTracks;
   }
 
-  // Sharded search: songs-filter shard + broad shard race in parallel, merged & deduped.
-  // Continuation chains are inherently sequential, but two independent queries are not.
-  async function ytSearchSharded(term, params, pageCount = 3) {
-    const songsParams = params || SEARCH_FILTERS.type.songs;
-    const [primary, broad] = await Promise.allSettled([
-      ytSearchPipelined(term, songsParams, pageCount),
-      pageCount > 1 ? ytSearchPipelined(term, undefined, 1) : Promise.resolve([])
-    ]);
-    const allTracks = [];
-    const dedup = new Set();
-    for (const result of [primary, broad]) {
-      if (result.status !== 'fulfilled') continue;
-      for (const t of result.value) {
-        if (!dedup.has(t.id)) {
-          allTracks.push(slimTrack(t));
-          dedup.add(t.id);
-        }
-      }
+  // --- Search state machine (v1.9.2) ----------------------------------------
+  // Three shards (songs filter, broad, music videos) fire in parallel and every
+  // page they return is merged into ONE growing result set. The first paint
+  // never waits for continuations, and page 2/3 requests read the same expanding
+  // set instead of re-running page 1 - which is why the app used to see ~26
+  // songs no matter how many pages it asked for.
+  const SEARCH_PAGE_DEPTH = 3;
+  const SEARCH_BROAD_DEPTH = 2;
+  const searchStates = new Map();
+  const searchComplete = new Set();
+
+  function newSearchState() {
+    return { key: null, tracks: [], seen: new Set(), done: false, cancelled: false, promise: null };
+  }
+
+  function pushSearchTracks(state, tracks) {
+    let added = 0;
+    for (const track of tracks || []) {
+      if (!track || !track.id || state.seen.has(track.id)) continue;
+      if (state.tracks.length >= SEARCH_MAX_TRACKS) break;
+      state.seen.add(track.id);
+      const slim = slimTrack(track);
+      state.tracks.push(slim);
+      indexTrackArtists([slim]);
+      added++;
     }
-    return allTracks;
+    if (added && state.key) ytRemember(state.key, state.tracks);
+    return added;
+  }
+
+  async function runSearchShard(state, term, params, maxPages) {
+    let continuation = null;
+    for (let page = 0; page < maxPages; page++) {
+      if (state.cancelled) return;
+      const data = page === 0
+        ? await ytPost('/search', { query: term, params }, 1)
+        : (continuation ? await ytPost('/search', { continuation }, 1) : null);
+      if (!data) return;
+      const parsed = page === 0 ? extractSearchTracks(data) : extractContinuationTracks(data);
+      pushSearchTracks(state, parsed.tracks);
+      continuation = parsed.continuation;
+      if (!continuation) return;
+    }
+  }
+
+  function searchKey(term, options) {
+    return 'search:' + term + '|' + (buildSearchParams(options) || 'all');
+  }
+
+  function searchStateFor(key, term, options) {
+    const existing = searchStates.get(key);
+    if (existing) return existing;
+
+    const cached = YT_CACHE.get(key);
+    const state = newSearchState();
+    state.key = key;
+    if (cached && Array.isArray(cached.value)) pushSearchTracks(state, cached.value);
+
+    const cacheFresh = !!cached && (Date.now() - (cached.time || 0)) < SEARCH_TTL_MS;
+    if (cacheFresh && searchComplete.has(key)) {
+      state.done = true;
+      searchStates.set(key, state);
+      return state;
+    }
+
+    if (searchStates.size >= SEARCH_STATE_MAX) {
+      const oldestKey = searchStates.keys().next().value;
+      const oldest = searchStates.get(oldestKey);
+      if (oldest) oldest.cancelled = true;
+      searchStates.delete(oldestKey);
+    }
+    searchStates.set(key, state);
+
+    const params = buildSearchParams(options);
+    const songsParams = params || SEARCH_FILTERS.type.songs;
+    const shards = [runSearchShard(state, term, songsParams, SEARCH_PAGE_DEPTH)];
+    // The extra shards only make sense for a plain track search, and they are
+    // free on the wall clock because they run alongside the songs shard.
+    if (!params || params === SEARCH_FILTERS.type.songs) {
+      shards.push(runSearchShard(state, term, undefined, SEARCH_BROAD_DEPTH));
+      shards.push(runSearchShard(state, term, SEARCH_FILTERS.type.videos, 1));
+    }
+
+    state.promise = Promise.allSettled(shards).then(() => {
+      state.done = true;
+      if (searchComplete.size >= 200) searchComplete.delete(searchComplete.values().next().value);
+      searchComplete.add(key);
+      if (state.tracks.length) ytRemember(key, state.tracks);
+      return state.tracks;
+    });
+    return state;
   }
 
   async function ytAudio(videoId, quality) {
-    const data = await ytPost('/player', { videoId, contentCheckOk: true, racyCheckOk: true });
+    const data = await ytPost('/player', { videoId, contentCheckOk: true, racyCheckOk: true }, 0);
     const formats = (data?.streamingData?.adaptiveFormats || []).filter(f => f.url && (!f.mimeType || f.mimeType.startsWith('audio/')));
     const target = Number(String(quality || '320').replace(/\D/g, '')) || 320;
     const best = formats.sort((a, b) => Math.abs((Number(b.bitrate || 0) / 1000) - target) - Math.abs((Number(a.bitrate || 0) / 1000) - target))[0];
@@ -308,8 +478,8 @@
     };
   }
   
-  async function ytRadio(seedVideoId) {
-    const data = await ytPost('/next', { videoId: seedVideoId, playlistId: 'RDAMVM' + seedVideoId });
+  async function ytRadio(seedVideoId, priority) {
+    const data = await ytPost('/next', { videoId: seedVideoId, playlistId: 'RDAMVM' + seedVideoId }, priority);
     const panel = data?.contents?.singleColumnMusicWatchNextResultsRenderer?.tabbedRenderer?.watchNextTabbedResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.musicQueueRenderer?.content?.playlistPanelRenderer;
     return (panel?.contents || []).map(entry => ytToTrack(entry.playlistPanelVideoRenderer || entry)).filter(Boolean);
   }
@@ -362,7 +532,7 @@
   async function mirrorGetJson(url) {
     const started = Date.now();
     try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(5000), headers: { Accept: 'application/json', 'User-Agent': 'Mozilla/5.0' } });
+      const res = await schedule(0, () => fetch(url, { signal: timeoutSignal(MIRROR_TIMEOUT_MS), headers: { Accept: 'application/json', 'User-Agent': 'Mozilla/5.0' } }));
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
       mirrorMark(url, Date.now() - started, true);
@@ -372,8 +542,9 @@
       throw error;
     }
   }
-  async function raceMirrors(pool, makeUrl) {
-    const candidates = mirrors(pool).slice(0, 3);
+  // Race the top candidates instead of stacking their timeouts one after another.
+  async function raceMirrors(pool, makeUrl, limit) {
+    const candidates = mirrors(pool).slice(0, limit || 2);
     if (!candidates.length) throw new Error('no healthy mirrors');
     return Promise.any(candidates.map(async base => {
       const data = await mirrorGetJson(makeUrl(base));
@@ -421,10 +592,8 @@
     const score = e => /trending 20/i.test(e.title) ? 3 : /daily top/i.test(e.title) ? 2 : /top \d+/i.test(e.title) ? 1 : 0;
     return entries.sort((a, b) => score(b) - score(a))[0] || null;
   }
-  async function getRealCharts(chartType = 'songs') {
+  async function fetchRealCharts(chartType = 'songs') {
     const cacheKey = 'charts:' + chartType;
-    const cached = ytCached(cacheKey, 3600000);
-    if (cached) return cached;
     
     try {
       const data = await ytPost('/browse', { browseId: 'FEmusic_charts' });
@@ -488,11 +657,83 @@
     }
   }
 
+  // Charts are read through the SWR helper: previous charts return at 0ms and a
+  // refresh runs in the background once the hour is up.
+  async function getRealCharts(chartType = 'songs') {
+    return readThrough('charts:' + chartType, 3600000, () => fetchRealCharts(chartType));
+  }
+
   // --- Taste engine (v1.8): learns from implicit play signals ---
   // No app changes required: every playback routes through extractAudioUrl and
   // every radio start through getRelatedTracks, so those calls ARE the signal.
   const TASTE_KEY = 'synthetiq_gateway_taste_v1';
-  const taste = { artists: new Map(), tracks: new Set(), sessions: 0 };
+  const taste = { artists: new Map(), tracks: new Set(), sessions: 0, revision: 0 };
+  // Set whenever a play changes what "your taste" means, so home sections can be
+  // rebuilt before the user refreshes instead of after.
+  let tasteDirty = false;
+  let tasteWarmTimer = null;
+  let tasteSaveTimer = null;
+  const TASTE_SAVE_DEBOUNCE_MS = 1200;
+
+  // Normalised single-artist key: 'A feat. B' and 'A, B' both key to 'a'.
+  function artistKey(artist) {
+    const first = String(artist || '').split(/,| feat\.| ft\.| & | x | with /i)[0];
+    return first.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim() || 'unknown';
+  }
+
+  function artistNames(artist) {
+    return String(artist || '')
+      .split(/,| feat\.| ft\.| & | x | with /i)
+      .map(part => part.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim())
+      .filter(Boolean);
+  }
+
+  function topArtistsForMatch(key) {
+    for (const name of taste.artists.keys()) {
+      if (artistKey(name) === key) return name;
+    }
+    return null;
+  }
+
+  // A resolved stream tells us the real artist, so the profile learns even when
+  // the track never appeared in a cached list before.
+  function rememberArtist(trackId, artist, weight) {
+    try {
+      const name = String(artist || '').trim();
+      if (!name || name === 'Unknown Artist') return;
+      const id = normalizeTrackId(String(trackId || ''));
+      if (id) trackArtists.set(id, name);
+      const key = artistKey(name);
+      if (!key || key === 'unknown') return;
+      const existing = topArtistsForMatch(key) || name;
+      taste.artists.set(existing, (taste.artists.get(existing) || 0) + (weight == null ? 1 : weight));
+      touchTaste();
+    } catch (_) {}
+  }
+
+  function touchTaste() {
+    taste.revision++;
+    tasteDirty = true;
+    invalidateTasteSections();
+  }
+
+  // Rebuild taste-driven home sections shortly after a play, so a refresh finds
+  // the new taste already cached rather than the previous track's shelves.
+  function invalidateTasteSections() {
+    try {
+      for (const entry of homePlan()) {
+        if (!entry.taste) continue;
+        markStale(entry.key);
+        const state = sectionCache.get(entry.key);
+        if (state) state.time = 0;
+      }
+    } catch (_) {}
+    if (tasteWarmTimer) return;
+    tasteWarmTimer = setTimeout(() => {
+      tasteWarmTimer = null;
+      try { primeHomeSections(true); } catch (_) {}
+    }, 2000);
+  }
 
   function detectStorage() {
     try { if (globalThis.localStorage) return globalThis.localStorage; } catch (_) {}
@@ -510,7 +751,7 @@
       taste.sessions = saved.sessions || 0;
     } catch (_) {}
   }
-  function tasteSave() {
+  function tasteSaveNow() {
     const store = detectStorage();
     if (!store) return;
     try {
@@ -519,9 +760,25 @@
       store.setItem(TASTE_KEY, JSON.stringify({ artists, tracks, sessions: taste.sessions, savedAt: Date.now() }));
     } catch (_) {}
   }
+  function flushTasteSave() {
+    if (tasteSaveTimer) {
+      clearTimeout(tasteSaveTimer);
+      tasteSaveTimer = null;
+    }
+    tasteSaveNow();
+  }
+  // The profile write is 10-20KB of JSON; doing it synchronously on every play was
+  // visible as jank while skipping tracks, so writes are coalesced.
+  function tasteSave() {
+    if (tasteSaveTimer) return;
+    tasteSaveTimer = setTimeout(() => { tasteSaveTimer = null; tasteSaveNow(); }, TASTE_SAVE_DEBOUNCE_MS);
+  }
   tasteLoad();
   taste.sessions += 1;
-  tasteSave();
+  tasteSaveNow();
+  try {
+    if (typeof globalThis.addEventListener === 'function') globalThis.addEventListener('pagehide', flushTasteSave);
+  } catch (_) {}
 
   function normalizeTrackId(id) {
     if (!id) return id;
@@ -537,22 +794,30 @@
       if (!/^synthetiq_music_gateway:(yt|song):/.test(id)) return;
       taste.tracks.add(id);
       if (taste.tracks.size > 500) taste.tracks.delete(taste.tracks.values().next().value);
-      // Artist resolution: check cached search/album/radio data first (free), else 0 cost skip.
-      // The play is still counted by track; artist is backfilled when cache has the track.
-      for (const key of YT_CACHE.keys()) {
-        const item = YT_CACHE.get(key);
-        if (Date.now() - item.time > 3600000) continue;
-        const value = item.value;
-        if (!Array.isArray(value)) continue;
-        const hit = value.find(t => t && t.id === id && t.artist && t.artist !== 'Unknown Artist');
-        if (hit) {
-          const artist = hit.artist.replace(/(,| feat\.| ft\.| &).*$/i, '').trim();
-          if (artist) {
-            taste.artists.set(artist, (taste.artists.get(artist) || 0) + weight);
+      // Artist resolution: O(1) index first, cache scan only as a fallback.
+      let artist = trackArtists.get(id);
+      if (!artist) {
+        for (const key of YT_CACHE.keys()) {
+          const item = YT_CACHE.get(key);
+          if (!item || Date.now() - (item.time || 0) > 3600000) continue;
+          const value = item.value;
+          if (!Array.isArray(value)) continue;
+          const hit = value.find(t => t && t.id === id && t.artist && t.artist !== 'Unknown Artist');
+          if (hit) {
+            artist = hit.artist;
+            indexTrackArtists([hit]);
+            break;
           }
-          break;
         }
       }
+      if (artist) {
+        const name = artist.replace(/(,| feat\.| ft\.| &).*$/i, '').trim();
+        if (name) {
+          const existing = topArtistsForMatch(artistKey(name)) || name;
+          taste.artists.set(existing, (taste.artists.get(existing) || 0) + weight);
+        }
+      }
+      touchTaste();
       // Only save if not suppressed by caller
       if (!dontSave) tasteSave();
     } catch (_) {}
@@ -564,10 +829,12 @@
 
   function affinityBoost(track) {
     if (!track) return 0;
+    const names = artistNames(track.artist);
+    if (!names.length) return 0;
     let score = 0;
-    const artist = String(track.artist || '');
     for (const [name, weight] of taste.artists) {
-      if (artist.includes(name)) score += weight;
+      const key = artistKey(name);
+      if (key && names.indexOf(key) !== -1) score += weight;
     }
     return score;
   }
@@ -586,34 +853,85 @@
         taste.artists.set(artist, (taste.artists.get(artist) || 0) + Number(weight || 1));
       }
       if (trackId) noteImplicitPlay(trackId, Number(weight || 1), true);  // Don't save yet
-      tasteSave();  // Save once at the end
+      touchTaste();
+      tasteSave();  // Coalesced write
     } catch (_) {}
   }
   
-  async function getSmartRecommendations(limit = 24) {
-    const artists = topArtists(5);
-    if (!artists.length) {
-      return await getRealCharts('songs');
+  function recentSeedVideoIds(count) {
+    const seeds = [];
+    for (const id of taste.tracks) {
+      const match = /^synthetiq_music_gateway:yt:([A-Za-z0-9_-]{6,})/.exec(id);
+      if (match) seeds.push(match[1]);
     }
+    return seeds.slice(-count).reverse();
+  }
 
-    const allRecommended = [];
-    const dedup = new Set();
+  // Diversity pass: round-robin across sources with a per-artist cap, so neither
+  // one artist nor one source can fill the whole shelf. This is what makes the
+  // recommendations move genre-first instead of artist-only.
+  function diversify(buckets, target) {
+    const maxPerArtist = Math.max(2, Math.min(5, Math.ceil(target / 8)));
+    const counts = new Map();
+    const used = new Set();
+    const picked = [];
+    const queues = buckets
+      .filter(b => b && Array.isArray(b.tracks) && b.tracks.length)
+      .map(b => ({ items: b.tracks.slice() }));
 
-    const artistPromises = artists.map(artist =>
-      ytSearchPipelined(artist + ' top songs', null, 1).catch(() => [])
-    );
-
-    const results = await Promise.all(artistPromises);
-    for (const tracks of results) {
-      for (const t of tracks) {
-        if (!dedup.has(t.id) && !taste.tracks.has(t.id)) {
-          allRecommended.push(t);
-          dedup.add(t.id);
+    let progress = true;
+    while (picked.length < target && progress) {
+      progress = false;
+      for (const queue of queues) {
+        while (queue.items.length) {
+          const track = queue.items.shift();
+          if (!track || !track.id || used.has(track.id)) continue;
+          const key = artistKey(track.artist);
+          if ((counts.get(key) || 0) >= maxPerArtist) continue;
+          counts.set(key, (counts.get(key) || 0) + 1);
+          used.add(track.id);
+          picked.push(track);
+          progress = true;
+          break;
         }
       }
     }
 
-    return rerankByAffinity(allRecommended).slice(0, limit);
+    // Small catalogs: top up without the artist cap instead of returning short.
+    for (const queue of queues) {
+      for (const track of queue.items) {
+        if (picked.length >= target) break;
+        if (!track || !track.id || used.has(track.id)) continue;
+        used.add(track.id);
+        picked.push(track);
+      }
+    }
+    return picked.slice(0, target);
+  }
+
+  async function getSmartRecommendations(limit = 24) {
+    const target = Math.max(6, Number(limit) || 24);
+    const hasTaste = taste.artists.size > 0 || taste.tracks.size > 0;
+    if (!hasTaste) {
+      const fresh = await ytSearchPipelined('popular music hits', SEARCH_FILTERS.type.songs, 1).catch(() => []);
+      return fresh.slice(0, target);
+    }
+
+    const artists = topArtists(4);
+    const jobs = [];
+    // 1) Radio from what you actually played: walks into neighbouring artists and
+    //    genres instead of replaying the one artist you just heard.
+    for (const seed of recentSeedVideoIds(3)) jobs.push(() => ytRadio(seed, 2));
+    // 2) A minority share of the artists you already love.
+    for (const artist of artists.slice(0, 3)) jobs.push(() => ytSearchPipelined(artist + ' top songs', null, 1));
+    // 3) Charts for popular, non-affinity variety (cached, usually free).
+    jobs.push(() => getRealCharts('songs'));
+
+    const settled = await Promise.allSettled(jobs.map(job => job().catch(() => [])));
+    const buckets = settled.map(result => ({
+      tracks: (result.status === 'fulfilled' ? result.value || [] : []).filter(t => t && t.id && !taste.tracks.has(t.id))
+    }));
+    return diversify(buckets, target);
   }
 
   const _cipherKey = '38346591';
@@ -753,13 +1071,13 @@
   function ok(data) { return { ok: true, data: JSON.stringify(data) }; }
   function fail(message) { return { ok: false, error: { message: String(message || 'Music gateway unavailable') } }; }
 
-  async function httpGet(url) {
+  async function httpGet(url, timeoutMs) {
     const headers = {
       'Accept': 'application/json',
       'User-Agent': 'Mozilla/5.0'
     };
     try {
-      const res = await fetch(url, { method: 'GET', headers });
+      const res = await schedule(0, () => fetch(url, { method: 'GET', headers, signal: timeoutSignal(timeoutMs || MIRROR_TIMEOUT_MS) }));
       if (res.status === 200) {
         return await res.json();
       }
@@ -767,14 +1085,23 @@
     return null;
   }
 
-  async function mirrorGet(path) {
-    for (const mirror of MIRRORS) {
-      const data = await httpGet(mirror + path);
-      if (data && (data.data || data.results || data.success || data.status === 'SUCCESS')) {
-        return data;
-      }
+  const hasMirrorPayload = data => !!(data && (data.data || data.results || data.success || data.status === 'SUCCESS'));
+
+  // Mirrors are raced in parallel. Walking them one-by-one used to add the full
+  // timeout of every dead mirror to each search / album / song resolution.
+  async function mirrorGet(path, timeoutMs) {
+    const candidates = MIRRORS.slice(0, 3);
+    if (!candidates.length) return null;
+    try {
+      return await Promise.any(candidates.map(base =>
+        httpGet(base + path, timeoutMs).then(data => {
+          if (!hasMirrorPayload(data)) throw new Error('unusable mirror response');
+          return data;
+        })
+      ));
+    } catch (_) {
+      return null;
     }
-    return null;
   }
 
   async function directJioSaavn(params) {
@@ -820,44 +1147,203 @@
     const term = String(query || '').trim();
     if (!term) return ok([]);
 
-    try {
-      const cacheKey = 'search:' + term + ':' + Number(page || 0) + ':' + JSON.stringify(options || null);
-      // SWR: 5-min fresh window, then serve stale (0ms) while refreshing once in background
-      const tracks = await swr(cacheKey, 300000, () =>
-        ytSearchSharded(term, buildSearchParams(options), page === 0 ? 3 : 1)
-      );
-      if (tracks?.length) return ok(rerankByAffinity(tracks));
-    } catch (_) {}
+    const pageNumber = Math.max(0, Number(page) || 0);
+    const key = searchKey(term, options);
 
     try {
-      const p = Number(page) + 1 || 1;
-      const res = await mirrorGet('/search/songs?query=' + encodeURIComponent(term) + '&page=' + p + '&limit=24');
+      // Fast path: one shared, growing result set per query. Page 1 returns the
+      // moment a shard lands; page 2/3 read the fully expanded set.
+      const state = searchStateFor(key, term, options);
+      if (!state.done) {
+        await waitFor(
+          pageNumber === 0
+            ? () => state.done || state.tracks.length >= SEARCH_FIRST_PAINT_TRACKS || (state.tracks.length > 0 && idleSearchShards(state))
+            : () => state.done,
+          pageNumber === 0 ? SEARCH_FIRST_PAINT_MS : SEARCH_EXPAND_WAIT_MS
+        );
+      }
+      if (state.tracks.length) {
+        return ok(pageNumber === 0 ? state.tracks : rerankByAffinity(state.tracks));
+      }
+    } catch (_) {}
+
+    const mirrorPage = pageNumber + 1 || 1;
+    try {
+      // Mirror fallback: both pages raced at once, so the fallback is one round
+      // trip instead of two sequential ones.
+      const res = await mirrorGet('/search/songs?query=' + encodeURIComponent(term) + '&page=' + mirrorPage + '&limit=50');
       const results = res?.data?.results || res?.results || [];
       if (results.length) {
-        return ok(results.map(toTrack).filter(Boolean));
+        const tracks = dedupeTracks(results.map(toTrack).filter(Boolean));
+        ytRemember(key, tracks);
+        return ok(tracks);
       }
     } catch (_) {}
 
     try {
-      const p = Number(page) + 1 || 1;
       const jio = await directJioSaavn({
         '__call': 'search.getSongSearchResults',
         'q': term,
-        'p': p,
-        'n': 24
+        'p': mirrorPage,
+        'n': 50
       });
       const results = jio?.results || jio?.songs?.data || [];
       if (results.length) {
-        return ok(results.map(toTrack).filter(Boolean));
+        const tracks = dedupeTracks(results.map(toTrack).filter(Boolean));
+        ytRemember(key, tracks);
+        return ok(tracks);
       }
     } catch (_) {}
 
     return ok([]);
   }
 
-  async function extractAudioUrl(trackId, quality, depth = 0) {
-    // Implicit play signal: a stream resolution IS a play (v1.8 taste engine)
-    noteImplicitPlay(trackId, 1, false);  // Allow save
+  // True once every shard has stopped pushing new tracks into the result set.
+  function idleSearchShards(state) {
+    return state.done || state.promise === null;
+  }
+
+  function dedupeTracks(tracks) {
+    const seen = new Set();
+    const out = [];
+    for (const track of tracks || []) {
+      if (!track || !track.id || seen.has(track.id)) continue;
+      seen.add(track.id);
+      out.push(track);
+    }
+    return out;
+  }
+
+  // First success wins; the slow routes are left running in the background
+  // instead of holding the play button hostage.
+  function firstSuccess(promises) {
+    return new Promise((resolve, reject) => {
+      if (!promises.length) return reject(new Error('nothing to race'));
+      let failures = 0;
+      for (const promise of promises) {
+        Promise.resolve(promise).then(resolve, () => {
+          failures++;
+          if (failures === promises.length) reject(new Error('all routes failed'));
+        });
+      }
+    });
+  }
+
+  function mirrorAudioPayload(data, format, quality) {
+    return {
+      url: format.url,
+      headers: {},
+      mimeType: format.type || format.mimeType || 'audio/mp4',
+      extension: 'mp4',
+      title: data?.title || 'Track',
+      artist: data?.author || 'Unknown Artist',
+      album: '',
+      artwork: Array.isArray(data?.videoThumbnails) ? data.videoThumbnails.slice(-1)[0]?.url : '',
+      quality: String(Math.round(Number(format.bitrate || 0) / 1000)) + 'kbps'
+    };
+  }
+
+  function songAudioPayload(songData, url, quality) {
+    const track = toTrack(songData);
+    return {
+      url,
+      headers: {},
+      mimeType: 'audio/mp4',
+      extension: 'mp4',
+      title: track?.title || 'Track',
+      artist: track?.artist || 'Unknown Artist',
+      album: track?.album || '',
+      artwork: track?.image || '',
+      durationSeconds: track?.durationSeconds,
+      quality: quality || 'high'
+    };
+  }
+
+  // YouTube routes raced together: the official player plus the best invidious
+  // and piped mirrors. Whichever answers first plays; no sequential timeouts.
+  async function resolveYoutubeAudio(videoId, quality) {
+    return dedupe('audio:' + videoId + ':' + (quality || ''), async () => {
+      const routes = [
+        ytAudio(videoId, quality),
+        (async () => {
+          const { data } = await raceMirrors('invidious', base => base + '/videos/' + encodeURIComponent(videoId), 2);
+          const format = pickAudioFormat(data?.adaptiveFormats || data?.audioStreams || [], quality);
+          if (!format?.url) throw new Error('no invidious format');
+          return mirrorAudioPayload(data, format, quality);
+        })(),
+        (async () => {
+          const { data } = await raceMirrors('piped', base => base + '/streams/' + encodeURIComponent(videoId), 1);
+          const format = pickAudioFormat(data?.adaptiveFormats || data?.audioStreams || [], quality);
+          if (!format?.url) throw new Error('no piped format');
+          return mirrorAudioPayload(data, format, quality);
+        })()
+      ];
+      return firstSuccess(routes);
+    });
+  }
+
+  // Catalogue/song routes raced together: mirror lookup and the direct provider
+  // call used to run one after the other, so a slow mirror doubled the wait.
+  async function resolveSongAudio(songId, quality, depth) {
+    return dedupe('songaudio:' + songId + ':' + (quality || ''), async () => {
+      const routes = [
+        (async () => {
+          const res = await mirrorGet('/songs/' + encodeURIComponent(songId), MIRROR_TIMEOUT_MS);
+          const songData = Array.isArray(res?.data) ? res.data[0] : res?.data;
+          if (!songData || !Array.isArray(songData.downloadUrl)) throw new Error('no downloadUrl');
+          let stream320 = null;
+          let streamFallback = null;
+          for (const candidate of songData.downloadUrl) {
+            if (!candidate?.url) continue;
+            if (String(candidate.quality).indexOf('320') !== -1) stream320 = candidate.url;
+            streamFallback = candidate.url;
+          }
+          const url = stream320 || streamFallback;
+          if (!url) throw new Error('no stream');
+          return songAudioPayload(songData, url, quality);
+        })(),
+        (async () => {
+          const jioRes = await directJioSaavn({ '__call': 'song.getDetails', 'pids': songId });
+          let songData = null;
+          if (jioRes) {
+            if (jioRes[songId]) songData = jioRes[songId];
+            else if (Array.isArray(jioRes.songs) && jioRes.songs.length) songData = jioRes.songs[0];
+            else if (jioRes.id) songData = jioRes;
+          }
+          const encUrl = songData?.more_info?.encrypted_media_url;
+          if (!encUrl) throw new Error('no encrypted url');
+          const decrypted = decryptMediaUrl(encUrl);
+          if (!decrypted || decrypted.indexOf('http') !== 0) throw new Error('undecryptable url');
+          let streamUrl = decrypted;
+          const wanted = String(quality || 'high').toLowerCase();
+          if (wanted.indexOf('320') !== -1 || wanted.indexOf('high') !== -1) {
+            streamUrl = decrypted.replace('_96.mp4', '_320.mp4').replace('_160.mp4', '_320.mp4').replace('_48.mp4', '_320.mp4');
+          }
+          return songAudioPayload(songData, streamUrl, quality);
+        })()
+      ];
+      if (!depth) {
+        // Authorised fallback: resolve the title instead, but only on the first
+        // hop so a dead provider cannot recurse through the whole catalogue.
+        routes.push((async () => {
+          const search = await searchResults(songId, 0);
+          if (!search.ok) throw new Error('no search');
+          const items = JSON.parse(search.data);
+          if (!items.length) throw new Error('no match');
+          const resolved = await extractAudioUrl(items[0].id, quality, 1, { silent: true });
+          if (!resolved?.ok) throw new Error('no resolved match');
+          const payload = JSON.parse(resolved.data);
+          if (!payload?.url) throw new Error('no url');
+          return payload;
+        })());
+      }
+      return firstSuccess(routes);
+    });
+  }
+
+  async function extractAudioUrl(trackId, quality, depth = 0, options = {}) {
+    // Implicit play signal: a stream resolution IS a play (v1.8 taste engine).
+    if (!options.silent) noteImplicitPlay(trackId, 1, false);  // Allow save
     let cleanId = String(trackId || '').trim();
     let queryForFallback = null;
     let ytVideo = null;
@@ -873,102 +1359,29 @@
 
     if (ytVideo) {
       const cacheKey = 'audio:' + ytVideo;
-      const cachedAudio = ytCached(cacheKey, 180000);
+      const cachedAudio = ytCached(cacheKey, AUDIO_TTL_MS);
       if (cachedAudio) return ok(cachedAudio);
       if (ytCached('audioFail:' + ytVideo, 60000)) return fail('This YouTube track could not be streamed.');
       try {
-        const audio = await ytAudio(ytVideo, quality);
-        if (audio) return ok(ytRemember(cacheKey, audio));
+        const audio = await resolveYoutubeAudio(ytVideo, quality);
+        if (audio) {
+          if (!options.silent) rememberArtist(ytVideo, audio.artist);
+          return ok(ytRemember(cacheKey, audio));
+        }
       } catch (_) {}
-      for (const pool of ['invidious', 'piped']) {
-        try {
-          const makeUrl = base => pool === 'invidious' ? base + '/videos/' + encodeURIComponent(ytVideo) : base + '/streams/' + encodeURIComponent(ytVideo);
-          const { data } = await raceMirrors(pool, makeUrl);
-          const format = pickAudioFormat(data?.adaptiveFormats || data?.audioStreams || [], quality);
-          if (format?.url) {
-            return ok(ytRemember(cacheKey, {
-              url: format.url,
-              headers: {},
-              mimeType: format.type || format.mimeType || 'audio/mp4',
-              extension: 'mp4',
-              title: data?.title || 'Track',
-              artist: data?.author || 'Unknown Artist',
-              album: '',
-              artwork: Array.isArray(data?.videoThumbnails) ? data.videoThumbnails.slice(-1)[0]?.url : '',
-              quality: String(Math.round(Number(format.bitrate || 0) / 1000)) + 'kbps'
-            }));
-          }
-        } catch (_) {}
-      }
       ytRemember('audioFail:' + ytVideo, true);
       return fail('This YouTube track could not be streamed.');
     }
 
     if (cleanId && !cleanId.startsWith('catalogue:') && cleanId.length >= 4 && cleanId.indexOf(':') === -1) {
+      const songCacheKey = 'audio:song:' + cleanId;
+      const cachedSong = ytCached(songCacheKey, AUDIO_TTL_MS);
+      if (cachedSong) return ok(cachedSong);
       try {
-        const res = await mirrorGet('/songs/' + cleanId);
-        const songData = Array.isArray(res?.data) ? res.data[0] : res?.data;
-        if (songData && Array.isArray(songData.downloadUrl)) {
-          let stream320 = null;
-          let streamFallback = null;
-          for (const d of songData.downloadUrl) {
-            if (d?.url) {
-              if (String(d.quality).indexOf('320') !== -1) stream320 = d.url;
-              streamFallback = d.url;
-            }
-          }
-          const bestUrl = stream320 || streamFallback;
-          if (bestUrl) {
-            const track = toTrack(songData);
-            return ok({
-              url: bestUrl,
-              headers: {},
-              mimeType: 'audio/mp4',
-              extension: 'mp4',
-              title: track?.title || 'Track',
-              artist: track?.artist || 'Unknown Artist',
-              album: track?.album || '',
-              artwork: track?.image || '',
-              durationSeconds: track?.durationSeconds,
-              quality: quality || 'high'
-            });
-          }
-        }
-      } catch (_) {}
-
-      try {
-        const jioRes = await directJioSaavn({
-          '__call': 'song.getDetails',
-          'pids': cleanId
-        });
-        let songData = null;
-        if (jioRes) {
-          if (jioRes[cleanId]) songData = jioRes[cleanId];
-          else if (Array.isArray(jioRes.songs) && jioRes.songs.length) songData = jioRes.songs[0];
-          else if (jioRes.id) songData = jioRes;
-        }
-        const encUrl = songData?.more_info?.encrypted_media_url;
-        if (encUrl) {
-          const dec = decryptMediaUrl(encUrl);
-          if (dec && dec.indexOf('http') === 0) {
-            let streamUrl = dec;
-            if (String(quality || 'high').toLowerCase().indexOf('320') !== -1 || String(quality || 'high').toLowerCase().indexOf('high') !== -1) {
-              streamUrl = dec.replace('_96.mp4', '_320.mp4').replace('_160.mp4', '_320.mp4').replace('_48.mp4', '_320.mp4');
-            }
-            const track = toTrack(songData);
-            return ok({
-              url: streamUrl,
-              headers: {},
-              mimeType: 'audio/mp4',
-              extension: 'mp4',
-              title: track?.title || 'Track',
-              artist: track?.artist || 'Unknown Artist',
-              album: track?.album || '',
-              artwork: track?.image || '',
-              durationSeconds: track?.durationSeconds,
-              quality: quality || 'high'
-            });
-          }
+        const song = await resolveSongAudio(cleanId, quality, depth);
+        if (song) {
+          if (!options.silent) rememberArtist('synthetiq_music_gateway:song:' + cleanId, song.artist);
+          return ok(ytRemember(songCacheKey, song));
         }
       } catch (_) {}
     }
@@ -979,17 +1392,17 @@
         const searchRes = await searchResults(query, 0);
         if (searchRes.ok) {
           const items = JSON.parse(searchRes.data);
-          
+
           // Try top 3 results in parallel
           const attempts = items
             .slice(0, 3)
-            .map(item => 
+            .map(item =>
               (item.id && item.id !== trackId)
-                ? extractAudioUrl(item.id, quality, depth + 1)
+                ? extractAudioUrl(item.id, quality, depth + 1, { silent: true })
                     .catch(() => ({ ok: false }))
                 : Promise.resolve({ ok: false })
             );
-          
+
           // Return first successful result
           const results = await Promise.allSettled(attempts);
           for (const result of results) {
@@ -1090,17 +1503,86 @@
   // Response budget guard: stop adding shelves once projected JSON nears the
   // app's 512KB maxResponseBytes cap (soft 450KB target), trimming lowest priority.
   const HOME_BUDGET_BYTES = 450000;
+  function estimatePayloadBytes(sections) {
+    let total = 32;
+    for (const section of sections || []) {
+      total += 64 + String(section.title || '').length * 2;
+      if (Array.isArray(section.items)) total += estimateCacheBytes(section.items);
+    }
+    return total;
+  }
   function withinBudget(sections) {
-    try {
-      let size = JSON.stringify(sections).length * 2; // conservative UTF-16 estimate
-      return size <= HOME_BUDGET_BYTES;
-    } catch (_) { return true; }
+    try { return estimatePayloadBytes(sections) <= HOME_BUDGET_BYTES; } catch (_) { return true; }
+  }
+
+  // --- Home shelves: cached per section (v1.9.2) ------------------------------
+  // Home used to be a single 15-minute SWR blob, so every refresh either waited
+  // for ~12 upstream calls or served shelves built from the previous taste.
+  // Each shelf now caches on its own and home paints from whatever is ready.
+  const SECTION_TTL_MS = 900000;
+  const sectionCache = new Map();
+
+  function homePlan() {
+    return [
+      { key: 'section:smart', title: taste.artists.size || taste.tracks.size ? 'For You (Your Taste)' : 'Popular Right Now', taste: true, max: 24, build: () => getSmartRecommendations(24) },
+      { key: 'section:radar', title: 'New Releases From Your Artists', taste: true, max: 12, build: () => getNewReleases(12) },
+      { key: 'section:tasteTrend', title: 'Trending In Your Taste', taste: true, max: 12, build: () => getTrendingInTaste(12) },
+      { key: 'section:charts', title: 'Charts & Top Hits', taste: false, max: 24, build: () => getRealCharts('songs') },
+      { key: 'section:trending', title: 'Trending Worldwide', taste: false, max: 24, build: buildTrendingSection }
+    ];
+  }
+
+  function ensureSection(entry, force) {
+    let state = sectionCache.get(entry.key);
+    if (!state) {
+      state = { value: null, time: 0, promise: null };
+      sectionCache.set(entry.key, state);
+    }
+    const fresh = state.value !== null && !force && (Date.now() - state.time) < SECTION_TTL_MS;
+    if (fresh || state.promise) return state;
+    state.promise = Promise.resolve().then(() => entry.build()).then(
+      value => {
+        state.value = Array.isArray(value) ? value : [];
+        state.time = Date.now();
+        state.promise = null;
+        return state.value;
+      },
+      () => {
+        state.promise = null;
+        return state.value || [];
+      }
+    );
+    return state;
+  }
+
+  function primeHomeSections(forceTaste) {
+    for (const entry of homePlan()) ensureSection(entry, !!forceTaste && entry.taste);
+  }
+
+  async function buildTrendingSection() {
+    const data = await ytPost('/search', { query: 'trending music hits', params: SEARCH_FILTERS.type.songs }, 1).catch(() => null);
+    if (!data) return [];
+    const items = (data?.contents?.tabbedSearchResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents || [])
+      .flatMap(section =>
+        section.musicShelfRenderer?.contents
+        || (section.musicCardShelfRenderer ? [section] : [])
+        || (section.itemSectionRenderer?.contents || []).map(inner => inner.musicResponsiveListItemRenderer || inner).filter(Boolean)
+      )
+      .map(item => ytToTrack(item.musicResponsiveListItemRenderer || item)).filter(Boolean).map(slimTrack);
+    const dedup = new Set();
+    const out = [];
+    for (const track of items) {
+      if (!track || !track.id || dedup.has(track.id)) continue;
+      dedup.add(track.id);
+      out.push(track);
+    }
+    return out.slice(0, 24);
   }
 
   // New-release radar: query known artists with an upload-date filter so fresh
   // drops surface without the app needing a follow list.
   async function getNewReleases(limit = 12) {
-    const artists = topArtists(3);
+    const artists = topArtists(2);
     if (!artists.length) return [];
     const results = await Promise.allSettled(artists.map(artist =>
       ytSearchPipelined(artist + ' new song', SEARCH_FILTERS.uploadDate.thisMonth, 1)
@@ -1135,52 +1617,31 @@
 
   async function homeSections(page) {
     if (Number(page) > 0) return ok([]);
-    const buildSections = async () => {
-      const sections = [];
-      try {
-        const chartsPromise = getRealCharts('songs');
-        const trendingPromise = ytPost('/search', { query: 'trending music hits', params: SEARCH_FILTERS.type.songs }).catch(() => null);
-        const smartPromise = getSmartRecommendations(24);
-        const radarPromise = getNewReleases(12);
-        const tasteTrendPromise = getTrendingInTaste(12);
+    const forceTaste = tasteDirty;
+    tasteDirty = false;
+    const entries = homePlan();
+    const states = entries.map(entry => ({ entry, state: ensureSection(entry, forceTaste && entry.taste) }));
 
-        const [charts, trendingData, smart, radar, tasteTrend] = await Promise.all([
-          chartsPromise, trendingPromise, smartPromise, radarPromise, tasteTrendPromise
-        ]);
+    const readyCount = () => states.filter(s => s.state.value !== null).length;
+    const initialized = () => states.every(s => s.state.value !== null);
+    const idle = () => states.every(s => s.state.promise === null);
+    const tasteSettled = () => !forceTaste || states.filter(s => s.entry.taste).every(s => s.state.promise === null);
 
-        if (radar?.length) {
-          sections.push({ title: 'New Releases From Your Artists', type: 'track', items: radar });
-        }
-        if (tasteTrend?.length) {
-          sections.push({ title: 'Trending In Your Taste', type: 'track', items: tasteTrend });
-        }
-        if (charts?.length) {
-          sections.push({ title: 'Charts & Top Hits', type: 'track', items: charts.slice(0, 24) });
-        }
+    // Progressive paint: hand back the shelves that are ready and never block
+    // past the soft deadline just to fill in the last one.
+    await waitFor(() => tasteSettled() && (initialized() || idle()), HOME_SOFT_DEADLINE_MS);
+    if (readyCount() === 0) await waitFor(() => readyCount() > 0, HOME_HARD_DEADLINE_MS);
 
-        if (trendingData) {
-          const items = (trendingData?.contents?.tabbedSearchResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents || [])
-            .flatMap(section =>
-              section.musicShelfRenderer?.contents
-              || (section.musicCardShelfRenderer ? [section] : [])
-              || (section.itemSectionRenderer?.contents || []).map(inner => inner.musicResponsiveListItemRenderer || inner).filter(Boolean)
-            )
-            .map(item => ytToTrack(item.musicResponsiveListItemRenderer || item)).filter(Boolean).map(slimTrack);
-          if (items.length) sections.push({ title: 'Trending Worldwide', type: 'track', items: items.slice(0, 24) });
-        }
-
-        if (smart?.length && taste.artists.size > 0) {
-          sections.push({ title: 'For You (Your Taste)', type: 'track', items: smart });
-        }
-
-        // Budget guard: drop lowest-priority shelves (end of array) until within budget
-        while (sections.length > 1 && !withinBudget(sections)) sections.pop();
-      } catch (_) {}
-      return sections;
-    };
-    // SWR for home: fresh 15 min, stale served at 0ms while revalidating
-    const sections = await swr('home', 900000, buildSections);
-    return sections?.length ? ok(sections) : fail('Music discovery is temporarily unavailable.');
+    const sections = [];
+    for (const { entry, state } of states) {
+      const items = Array.isArray(state.value) ? state.value : [];
+      if (!items.length) continue;
+      sections.push({ title: entry.title, type: 'track', items: items.slice(0, entry.max || 24) });
+    }
+    if (!sections.length) return fail('Music discovery is temporarily unavailable.');
+    // Budget guard: drop lowest-priority shelves (end of array) until within budget
+    while (sections.length > 1 && !withinBudget(sections)) sections.pop();
+    return ok(sections);
   }
 
   async function getRelatedTracks(seedId) {
