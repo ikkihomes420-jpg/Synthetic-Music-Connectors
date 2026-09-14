@@ -18,11 +18,16 @@ async function expand(st,q){if(st.promise)return st.promise;st.promise=(async()=
 async function search(q,page=0,options){q=String(q||'').trim();if(!q)return{ok:true,data:'[]'};page=Math.max(0,Number(page)||0);const k=q+'|'+String(typeof options==='string'?options:'');let st=searches.get(k);if(!st){st={tracks:[],seen:new Set(),done:false,promise:null,params:typeof options==='string'?options:undefined};searches.set(k,st)}expand(st,q);const deadline=page?1200:650,start=Date.now();while(!st.tracks.length&&!st.done&&Date.now()-start<deadline)await new Promise(r=>setTimeout(r,10));const part=st.tracks.slice(page*50,page*50+50);return{ok:true,data:JSON.stringify(part.length?part:st.tracks.slice(0,50))}}
 async function audio(id){const v=String(id||'').includes(':yt:')?String(id).split(':yt:')[1]:/^[A-Za-z0-9_-]{11}$/.test(String(id||''))?String(id):null;if(!v)throw Error('unsupported id');const h=audioCache.get(v);if(h&&Date.now()-h.t<900000)return h.v;const routes=[post('/player',{videoId:v,contentCheckOk:true,racyCheckOk:true}),...STREAMS.map(b=>get(b+(b.includes('piped')?'/streams/':'/videos/')+encodeURIComponent(v),{},2200))];const d=await Promise.any(routes);const fs=d?.streamingData?.adaptiveFormats||d?.adaptiveFormats||d?.audioStreams||[];const f=fs.filter(x=>x?.url&&(!x.mimeType||String(x.mimeType).startsWith('audio/'))).sort((a,b)=>Number(b.bitrate||0)-Number(a.bitrate||0))[0];if(!f?.url)throw Error('no audio');const out={url:f.url,headers:{},mimeType:f.mimeType||'audio/mp4',extension:'mp4',title:d?.videoDetails?.title||d?.title||'Track',artist:d?.videoDetails?.author||d?.author||'Unknown Artist',album:'',artwork:d?.videoDetails?.thumbnail?.thumbnails?.at(-1)?.url||'',durationSeconds:Number(d?.videoDetails?.lengthSeconds)||undefined,quality:Math.round(Number(f.bitrate||0)/1000)+'kbps'};audioCache.set(v,{t:Date.now(),v:out});return out}
 async function fastAudio(id,q,depth,opts={}){try{return{ok:true,data:JSON.stringify(await audio(id))}}catch(e){
-  // The fast path only parses YouTube IDs. Catalogue / song IDs (and anything
-  // else it cannot parse) are handed to the full resolver from index.js, which
-  // knows the mirror + provider routes — previously they failed outright here.
-  if(originalExtractAudioUrl&&/unsupported id/.test(String(e&&e.message))){try{return await originalExtractAudioUrl(id,q,depth,opts)}catch(_){}}
-  return{ok:false,error:{message:'No fast streaming route available for this track.'}}}}
+  // The fast route only knows a handful of YouTube endpoints, and public
+  // mirrors bot-block aggressively. Anything the fast route cannot resolve —
+  // unparseable IDs, blocked/empty YouTube routes, dead mirrors — falls
+  // through to the full resolver, which has the complete mirror pools (with
+  // health tracking) and provider routes. The full resolver is the superset;
+  // the fast path is purely a latency shortcut, never the last word.
+  // Recursion is bounded: the full resolver's query fallback only fires at
+  // depth < 1 and re-enters here with depth + 1.
+  if(originalExtractAudioUrl){try{return await originalExtractAudioUrl(id,q,depth,opts)}catch(_){}}
+  return{ok:false,error:{message:'No streaming route available for this track.'}}}}
 async function home(page=0){if(Number(page)>0)return{ok:true,data:'[]'};if(lastHome){if(!homeRefresh&&originalHome)homeRefresh=Promise.resolve(originalHome(0)).then(v=>{if(v?.ok)lastHome=v}).catch(()=>{}).finally(()=>homeRefresh=null);return lastHome}if(!originalHome)return{ok:true,data:'[]'};const v=await Promise.race([originalHome(0),new Promise(r=>setTimeout(()=>r(null),900))]);if(v?.ok)lastHome=v;return v?.ok?v:{ok:true,data:'[]'}}
 (async()=>{try{await import('./index.js')}catch(_){}originalHome=globalThis.homeSections;if(globalThis.extractAudioUrl&&globalThis.extractAudioUrl!==fastAudio)originalExtractAudioUrl=globalThis.extractAudioUrl;globalThis.searchResults=search;globalThis.searchAdvanced=(q,o)=>search(q,0,o);globalThis.extractAudioUrl=fastAudio;globalThis.homeSections=home})();
 })();
