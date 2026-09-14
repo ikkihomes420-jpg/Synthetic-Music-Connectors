@@ -8,17 +8,19 @@
       "moduleIdentity": "SP-MUS-3006-MUSIC-GATEWAY",
       "moduleIdentityNumber": 3006,
       "contentType": "music",
-      "version": "1.10.1",
+      "version": "1.10.2",
       "releaseTrack": "production",
-      "file": "modules_fixed/synthetiq_music_gateway/fast.js",
-      "sha256": "bb0bd156174952ddee06f2f4db21803ca45ca4333f7c75e4ab74edb237690771",
+      "file": "packages/Synthetiq-Music-Gateway-1.10.2.zip",
+      "sha256": "6b40ea32a2b538096ff917914517f6d0af0a5deb6e1e2aaf97ba4a580533d697",
       "changelog": [
-        "Fix: non-YouTube track IDs (song:, catalogue:) now fall through to the full audio resolver instead of failing in the fast runtime — catalogue tracks play again.",
+        "Fix: 1.10.x is now shipped as a proper module ZIP (index.js + module.json + manifest.json, same layout as 1.9.2) so the app's package inspector accepts it \u2014 the raw fast.js file failed install with 'module entry count invalid'.",
+        "Fix: non-YouTube track IDs (song:/catalogue:) no longer fail outright in the low-latency runtime; they delegate to the full audio resolver, restoring catalogue track playback.",
         "Fix: catalog SHA-256 now matches the exact 1.10.1 runtime file.",
         "Performance: progressive search and continuation expansion target sub-second first paint and up to 150 results.",
         "Performance: playback routes race in parallel and resolved streams are cached for rapid skipping.",
         "Performance: Home is cache-first with background refresh."
-      ]
+      ],
+      "publishedAt": "2026-09-14T00:00:00Z"
     },
     {
       "moduleId": "synthetiq-music-gateway-v1",
